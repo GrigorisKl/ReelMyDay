@@ -19,12 +19,9 @@ function buildTransporter(): Transporter | null {
     );
     return null;
   }
-  // default secure=true for 465; false otherwise (unless SMTP_SECURE explicitly given)
   const port = Number(SMTP_PORT || 465);
   const secure =
-    typeof SMTP_SECURE === "string"
-      ? SMTP_SECURE !== "false"
-      : port === 465;
+    typeof SMTP_SECURE === "string" ? SMTP_SECURE !== "false" : port === 465;
 
   return nodemailer.createTransport({
     host: SMTP_HOST,
@@ -47,18 +44,14 @@ export type MailParams = {
   text?: string;
 };
 
-/**
- * Never throws. Returns { ok: true } on success, { ok: false, error } on failure.
- */
+/** Preferred: never throws; returns ok/error. */
 export async function sendMailSafe(
   { to, subject, html, text }: MailParams
 ): Promise<{ ok: boolean; error?: string }> {
   try {
     const t = getTransporter();
-    if (!t) {
-      // SMTP not configured — don't crash API
-      return { ok: false, error: "smtp_not_configured" };
-    }
+    if (!t) return { ok: false, error: "smtp_not_configured" };
+
     await t.sendMail({
       from: SMTP_FROM || SMTP_USER || "no-reply@localhost",
       to,
@@ -71,4 +64,12 @@ export async function sendMailSafe(
     console.error("MAILER_FAIL", e?.message || e);
     return { ok: false, error: e?.message || "mailer_error" };
   }
+}
+
+/**
+ * Compatibility wrapper for older code that imports `sendMail`.
+ * Same params, returns Promise<void>, swallows errors.
+ */
+export async function sendMail(p: MailParams): Promise<void> {
+  await sendMailSafe(p); // ignore result to preserve void signature
 }
