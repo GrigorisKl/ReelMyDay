@@ -4,9 +4,9 @@
    - Blurred "cover" background so landscape/portrait never show black bars
    - Video support (optional blur, keep/don’t keep original audio)
    - Optional background music (mp3, looped/trimmed to video)
-   - One-free export gating (owner & PRO emails unlimited)
-   - Per-user render history in DB (and still writes file-based JSON for compatibility)
-   - Auto-prune: keep only latest 20 renders per user (deletes older files + DB rows)
+   - Gating: 1 free export per user; owner/isPro/active Stripe sub = unlimited
+   - Per-user render history in DB + auto-prune to latest 20 (deletes old files + DB rows)
+   - Legacy JSON writes kept for compatibility (not used for gating)
 
    Requires: npm i ffmpeg-static ffprobe-static
 */
@@ -22,19 +22,8 @@ import type { Session } from "next-auth";
 import { authOptions } from "./auth/[...nextauth]";
 import { prisma } from "../../lib/prisma";
 
-// ---------- Whitelist / Pro ----------
+// ---------- Owner ----------
 const OWNER_EMAIL = "grigoriskleanthous@gmail.com";
-function envProEmails(): Set<string> {
-  const s = (process.env.PRO_EMAILS || "")
-    .split(",")
-    .map((e) => e.trim().toLowerCase())
-    .filter(Boolean);
-  return new Set(s);
-}
-function isWhitelisted(email: string): boolean {
-  const e = (email || "").toLowerCase();
-  return !!e && (e === OWNER_EMAIL.toLowerCase() || envProEmails().has(e));
-}
 
 // ---------- Render Tunables ----------
 const WIDTH = 1080;
@@ -139,9 +128,8 @@ function saveIncomingItem(tmpDir: string, item: any, i: number): string {
   throw new Error("missing_input");
 }
 
-// ---------- Usage & History (file-based, kept for compatibility) ----------
+// ---------- Legacy JSON (compat only; not used for gating) ----------
 const DATA_DIR = path.join(process.cwd(), "data");
-const USAGE_FILE = path.join(DATA_DIR, "usage.json");
 const RENDERS_FILE = path.join(DATA_DIR, "renders.json");
 function readJSON<T = any>(file: string, fallback: T): T {
   try {
@@ -153,17 +141,7 @@ function readJSON<T = any>(file: string, fallback: T): T {
 function writeJSON(file: string, data: any) {
   try { ensureDir(DATA_DIR); fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8"); } catch {}
 }
-function getCount(email: string): number {
-  const m = readJSON<Record<string, number>>(USAGE_FILE, {});
-  return m[email.toLowerCase()] || 0;
-}
-function bumpCount(email: string) {
-  const key = email.toLowerCase();
-  const m = readJSON<Record<string, number>>(USAGE_FILE, {});
-  m[key] = (m[key] || 0) + 1;
-  writeJSON(USAGE_FILE, m);
-}
-function recordRender(email: string, url: string, itemsCount: number) {
+function recordRenderLegacy(email: string, url: string, itemsCount: number) {
   const list = readJSON<any[]>(RENDERS_FILE, []);
   list.push({ email: email.toLowerCase(), url, itemsCount, createdAt: new Date().toISOString() });
   writeJSON(RENDERS_FILE, list);
@@ -190,11 +168,6 @@ type Motion = "zoom_in" | "zoom_out" | "pan_left" | "pan_right" | "cover";
 type Kind = "image" | "video";
 
 // ---------- Constant-box Ken-Burns (no jitter) ----------
-/**
- * Build per-clip filter (contain + blurred bg + SMOOTH zoom/pan inside a fixed box)
- * - Foreground box stays constant (no jitter); zoom/pan is scale+crop inside it.
- * - No stretch (contain), blurred background fill, setsar=1 everywhere.
- */
 function buildContainWithBlurVF(
   kind: Kind,
   secondsDur: number,
@@ -208,66 +181,48 @@ function buildContainWithBlurVF(
   const rw = rotated ? srcH : srcW;
   const rh = rotated ? srcW : srcH;
 
-  // Foreground "contain" size inside 1080x1920 (constant for the whole segment)
+  // Foreground box that remains CONSTANT (prevents overlay jitter)
   const dims = fitDims(rw, rh);
   const fw = even(dims.fw);
   const fh = even(dims.fh);
 
-  // Animation timing
   const frames = Math.max(2, Math.round(secondsDur * FPS));
   const maxIdx = frames - 1;
 
-  // Zoom factors (>=1 to avoid invalid crops)
-  const DZ = 0.20; // 20% total zoom range
-  const zin  = `1.00 + ${DZ.toFixed(2)}*(n/${maxIdx})`;     // 1.00 -> 1.20
-  const zout = `1.20 - ${DZ.toFixed(2)}*(n/${maxIdx})`;     // 1.20 -> 1.00
-  const zpan = `1.08`;                                      // headroom for pans
+  const DZ = 0.20; // total zoom range
+  const zin  = `1.00 + ${DZ.toFixed(2)}*(n/${maxIdx})`; // 1.00 -> 1.20
+  const zout = `1.20 - ${DZ.toFixed(2)}*(n/${maxIdx})`; // 1.20 -> 1.00
+  const zpan = `1.08`;                                  // headroom for pans
 
-  // Optional rotation
   const rotVF =
     rot === 90  ? "transpose=1," :
     rot === 180 ? "transpose=1,transpose=1," :
     rot === 270 ? "transpose=2," : "";
 
-  // Foreground pipeline in two stages:
-  //   [fg0] = contain to (fw x fh) once (constant size)
-  //   then per-frame: scale by z and crop back to fw x fh to simulate zoom OR pan
   let fgAnim: string;
   if (kind === "image") {
     if (motion === "zoom_in") {
-      fgAnim =
-        `[fg0]scale=w='iw*(${zin})':h='ih*(${zin})':eval=frame,` +
-        `crop=${fw}:${fh}:x='(iw-ow)/2':y='(ih-oh)/2'[fgi]`;
+      fgAnim = `[fg0]scale=w='iw*(${zin})':h='ih*(${zin})':eval=frame,crop=${fw}:${fh}:x='(iw-ow)/2':y='(ih-oh)/2'[fgi]`;
     } else if (motion === "zoom_out") {
-      fgAnim =
-        `[fg0]scale=w='iw*(${zout})':h='ih*(${zout})':eval=frame,` +
-        `crop=${fw}:${fh}:x='(iw-ow)/2':y='(ih-oh)/2'[fgi]`;
+      fgAnim = `[fg0]scale=w='iw*(${zout})':h='ih*(${zout})':eval=frame,crop=${fw}:${fh}:x='(iw-ow)/2':y='(ih-oh)/2'[fgi]`;
     } else if (motion === "pan_left") {
-      fgAnim =
-        `[fg0]scale=w='iw*(${zpan})':h='ih*(${zpan})':eval=frame,` +
-        `crop=${fw}:${fh}:x='(iw-ow)/2 - (iw-ow)/2*(n/${maxIdx})':y='(ih-oh)/2'[fgi]`;
+      fgAnim = `[fg0]scale=w='iw*(${zpan})':h='ih*(${zpan})':eval=frame,crop=${fw}:${fh}:x='(iw-ow)/2 - (iw-ow)/2*(n/${maxIdx})':y='(ih-oh)/2'[fgi]`;
     } else if (motion === "pan_right") {
-      fgAnim =
-        `[fg0]scale=w='iw*(${zpan})':h='ih*(${zpan})':eval=frame,` +
-        `crop=${fw}:${fh}:x='(iw-ow)/2 + (iw-ow)/2*(n/${maxIdx})':y='(ih-oh)/2'[fgi]`;
+      fgAnim = `[fg0]scale=w='iw*(${zpan})':h='ih*(${zpan})':eval=frame,crop=${fw}:${fh}:x='(iw-ow)/2 + (iw-ow)/2*(n/${maxIdx})':y='(ih-oh)/2'[fgi]`;
     } else {
       fgAnim = `[fg0]copy[fgi]`;
     }
   } else {
-    // For video clips, keep it simple and stable (no per-frame scale)
     fgAnim = `[fg0]copy[fgi]`;
   }
 
-  // Fades
   const fin = 0.25;
   const fout = Math.max(0.25, Math.min(0.6, secondsDur * 0.15));
 
-  // Background (blurred cover fill) or plain cover if blur disabled
   const bgBase = useBlur
     ? `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase:flags=${SWS},crop=${WIDTH}:${HEIGHT},gblur=sigma=36`
     : `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase:flags=${SWS},crop=${WIDTH}:${HEIGHT}`;
 
-  // Full graph (overlay box is constant -> no jitter)
   const vf =
     `${rotVF}setsar=1,split=2[bg][fg];` +
     `[bg]${bgBase},setsar=1[bg];` +
@@ -313,8 +268,7 @@ async function makeImageSegment(
 
 function baseFitVideo(bgBlur: boolean): string {
   if (!bgBlur) {
-    return `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=${SWS},` +
-           `pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`;
+    return `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=${SWS},pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`;
   }
   return [
     `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=${SWS}[fit]`,
@@ -390,10 +344,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const email = session?.user?.email || null;
   if (!email) return res.status(401).json({ ok: false, message: "Please sign in to export." });
 
-  // 1 free export unless whitelisted/Pro
-  if (!isWhitelisted(email)) {
-    const used = getCount(email);
-    if (used >= 1) return res.status(402).json({ ok: false, message: "Free limit reached. Please subscribe to continue." });
+  // DB-based gating
+  const user = await prisma.user.findUnique({
+    where: { email: email.toLowerCase() },
+    select: { id: true, isPro: true, exportsUsed: true, stripeSubscriptionId: true },
+  });
+  if (!user) return res.status(401).json({ ok: false, message: "Please sign in to export." });
+
+  const isOwner = email.toLowerCase() === OWNER_EMAIL.toLowerCase();
+  const isPro = isOwner || !!user.isPro || !!user.stripeSubscriptionId;
+
+  if (!isPro && (user.exportsUsed ?? 0) >= 1) {
+    return res.status(402).json({ ok: false, message: "Free limit reached. Please subscribe to continue." });
   }
 
   try {
@@ -417,9 +379,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
 
     // Prepare output dirs
-    const rendersDir = ensureRendersDir();
+    const rendersAbs = ensureRendersDir();
     const jobId = String(nowTs());
-    const jobDir = path.join(rendersDir, `tmp-${jobId}`);
+    const jobDir = path.join(rendersAbs, `tmp-${jobId}`);
     ensureDir(jobDir);
 
     // Build each segment
@@ -443,7 +405,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     await writeConcatListAbsolute(segPaths, listPath);
 
     const outName = `reel-${jobId}.mp4`;
-    const outPath = path.join(rendersDir, outName);
+    const outPath = path.join(rendersAbs, outName);
     await concatSegments(listPath, outPath);
 
     // Optional background music (only if not keeping original video audio)
@@ -464,55 +426,45 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       fs.rmdirSync(jobDir);
     } catch {}
 
-    // Gating counter
-    if (!isWhitelisted(email)) bumpCount(email);
-
     const relUrl = `/renders/${path.basename(finalPath)}`;
-    recordRender(email, relUrl, items.length); // legacy JSON list
 
-    // --- Persist in DB + prune per-user to latest 20 (guarded if model isn't generated yet) ---
-    try {
-      const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
-      const p: any = prisma as any; // cast to access .render even if types aren't regenerated yet
+    // Legacy JSON record (optional)
+    recordRenderLegacy(email, relUrl, items.length);
 
-      if (user && p.render) {
-        const stat = fs.statSync(finalPath);
-        const fileName = path.basename(finalPath);
+    // Persist in DB
+    const stat = fs.statSync(finalPath);
+    const fileName = path.basename(finalPath);
+    await prisma.render.create({
+      data: {
+        userId: user.id,
+        fileName,
+        url: relUrl,
+        bytes: stat.size,
+      },
+    });
 
-        // Save DB row
-        await p.render.create({
-          data: {
-            userId: user.id,
-            fileName,
-            url: relUrl,
-            bytes: stat.size,
-          },
-        });
-
-        // Keep only latest 20, delete older (DB + files)
-        const KEEP = 20;
-        const toDelete = await p.render.findMany({
-          where: { userId: user.id },
-          orderBy: { createdAt: "desc" },
-          skip: KEEP,
-          select: { id: true, fileName: true },
-        });
-
-        if (toDelete.length) {
-          for (const r of toDelete) {
-            const pth = path.join(rendersDir, r.fileName);
-            try { fs.unlinkSync(pth); } catch {}
-          }
-          await p.render.deleteMany({
-            where: { id: { in: toDelete.map((r: any) => r.id) } },
-          });
-        }
-      } else if (user && !p.render) {
-        console.warn("Render model not available on Prisma client yet; skipping DB persist/prune.");
+    // Auto-prune to newest 20 per user (delete old files + DB rows)
+    const KEEP = 20;
+    const old = await prisma.render.findMany({
+      where: { userId: user.id },
+      orderBy: { createdAt: "desc" },
+      skip: KEEP,
+      select: { id: true, fileName: true },
+    });
+    if (old.length) {
+      for (const r of old) {
+        const pth = path.join(rendersAbs, r.fileName);
+        try { fs.unlinkSync(pth); } catch {}
       }
-    } catch (dbErr) {
-      console.error("RENDER_DB_PERSIST_OR_PRUNE_FAIL", dbErr);
-      // don't fail the render if DB hiccups
+      await prisma.render.deleteMany({ where: { id: { in: old.map(r => r.id) } } });
+    }
+
+    // Increment free counter only for non-Pro users
+    if (!isPro) {
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { exportsUsed: (user.exportsUsed ?? 0) + 1 },
+      });
     }
 
     return res.json({ ok: true, url: relUrl });
