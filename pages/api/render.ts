@@ -44,6 +44,11 @@ const PRESET = "veryfast";
 const CRF = "23";
 const SWS = "bicubic+accurate_rnd+full_chroma_int";
 
+// memory safety: cap captured ffmpeg output (avoid OOM)
+const MAX_LOG = 5000;
+// control encoder threads to reduce memory spikes (default 1; raise if you have RAM)
+const FFMPEG_THREADS = Number(process.env.FFMPEG_THREADS || "1");
+
 // ---------- FS helpers ----------
 function ensureDir(p: string) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
 function nowTs() { return Date.now(); }
@@ -53,16 +58,33 @@ const fwd = (p: string) => p.replace(/\\/g, "/");
 function run(bin: string, args: string[], cwd?: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const p = spawn(bin, args, { cwd, windowsHide: true });
-    let out = ""; let err = "";
-    p.stdout.on("data", d => out += d.toString());
-    p.stderr.on("data", d => err += d.toString());
-    p.on("close", code => code === 0 ? resolve(out || err) : reject(new Error(`${bin} exited with ${code}\n${err}`)));
+
+    let out = "";
+    let err = "";
+
+    p.stdout.on("data", (d) => {
+      out += d.toString();
+      if (out.length > MAX_LOG) out = out.slice(-MAX_LOG);
+    });
+    p.stderr.on("data", (d) => {
+      err += d.toString();
+      if (err.length > MAX_LOG) err = err.slice(-MAX_LOG);
+    });
+
+    p.on("close", (code) => {
+      if (code === 0) return resolve(out || err);
+      reject(new Error(`${bin} exited with ${code}\n${err}`));
+    });
   });
 }
+
 function runFF(args: string[]) {
   const bin = (ffmpegPath as string) || process.env.FFMPEG_PATH || "ffmpeg";
-  return run(bin, args);
+  // Quiet flags first to reduce stderr volume
+  const quiet = ["-hide_banner", "-loglevel", "error", "-nostats", "-nostdin"];
+  return run(bin, [...quiet, ...args]);
 }
+
 function probe(input: string): Promise<{ width: number; height: number; rotation: number }> {
   const ffprobePath = (ffprobeMod as any)?.path || (ffprobeMod as any) || "ffprobe";
   const args = [
@@ -83,7 +105,7 @@ function probe(input: string): Promise<{ width: number; height: number; rotation
     } catch {
       return { width: WIDTH, height: HEIGHT, rotation: 0 };
     }
-  });
+  }).catch(() => ({ width: WIDTH, height: HEIGHT, rotation: 0 }));
 }
 
 function guessExt(name?: string, mime?: string) {
@@ -285,24 +307,37 @@ async function makeImageSegment(
     "-filter_complex", vf + "[v]",
     "-map", "[v]",
     "-map", "1:a",
-    "-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-pix_fmt", "yuv420p", "-r", String(FPS),
-    "-c:a", "aac", "-b:a", "160k",
+    "-c:v", "libx264",
+    "-preset", PRESET,
+    "-crf", CRF,
+    "-pix_fmt", "yuv420p",
+    "-r", String(FPS),
+    "-threads", String(Math.max(1, FFMPEG_THREADS)),
+    "-c:a", "aac",
+    "-b:a", "160k",
     "-shortest",
     outPath,
   ];
   await runFF(args);
 }
 
+// Proper split graph for video: avoid referencing [0:v] twice without split
 function baseFitVideo(bgBlur: boolean): string {
   if (!bgBlur) {
-    return `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=${SWS},pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`;
+    // just contain with possible padding
+    return `split=1[vx];` + // create a named stream to keep a consistent pattern
+           `[vx]scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=${SWS},` +
+           `pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`;
   }
+  // bg (cover+blur) and fit (contain) from a single split
   return [
-    `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=${SWS}[fit]`,
-    `[0:v]scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase:flags=${SWS},crop=${WIDTH}:${HEIGHT},gblur=sigma=36[bg]`,
-    `[bg][fit]overlay=(W-w)/2:(H-h)/2`,
+    `split=2[vfit][vbg]`,
+    `[vfit]scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=${SWS}[fit]`,
+    `[vbg]scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase:flags=${SWS},crop=${WIDTH}:${HEIGHT},gblur=sigma=36[bg]`,
+    `[bg][fit]overlay=(W-w)/2:(H-h)/2`
   ].join(";");
 }
+
 async function makeVideoSegment(
   inputPath: string,
   outPath: string,
@@ -310,16 +345,23 @@ async function makeVideoSegment(
   bgBlur: boolean,
   trimToSec?: number
 ) {
+  // Build a filtergraph that starts with [0:v] and immediately splits
   const base = baseFitVideo(bgBlur);
-  const vf = `${base},fps=${FPS},format=yuv420p,setsar=1`;
-  const args: string[] = ["-y", "-i", inputPath];
-  if (trimToSec && trimToSec > 0) args.unshift("-t", String(trimToSec));
+  const vf = `[0:v]${base},fps=${FPS},format=yuv420p,setsar=1[v]`;
+  const args: string[] = ["-y"];
+  if (trimToSec && trimToSec > 0) args.push("-t", String(trimToSec));
+  args.push("-i", inputPath);
 
   if (keepAudio) {
     args.push(
-      "-filter_complex", `[0:v]${vf}[v]`,
+      "-filter_complex", vf,
       "-map", "[v]", "-map", "0:a?",
-      "-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-pix_fmt", "yuv420p", "-r", String(FPS),
+      "-c:v", "libx264",
+      "-preset", PRESET,
+      "-crf", CRF,
+      "-pix_fmt", "yuv420p",
+      "-r", String(FPS),
+      "-threads", String(Math.max(1, FFMPEG_THREADS)),
       "-c:a", "aac", "-ac", "2", "-ar", "44100", "-b:a", "160k",
       "-shortest",
       outPath
@@ -327,9 +369,14 @@ async function makeVideoSegment(
   } else {
     args.push(
       "-f", "lavfi", "-t", trimToSec ? String(trimToSec) : "9999", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-      "-filter_complex", `[0:v]${vf}[v]`,
+      "-filter_complex", vf,
       "-map", "[v]", "-map", "1:a",
-      "-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-pix_fmt", "yuv420p", "-r", String(FPS),
+      "-c:v", "libx264",
+      "-preset", PRESET,
+      "-crf", CRF,
+      "-pix_fmt", "yuv420p",
+      "-r", String(FPS),
+      "-threads", String(Math.max(1, FFMPEG_THREADS)),
       "-c:a", "aac", "-ac", "2", "-ar", "44100", "-b:a", "160k",
       "-shortest",
       outPath
@@ -434,13 +481,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       try { fs.unlinkSync(outPath); } catch {}
     }
 
-    try {
-      for (const f of segPaths) fs.unlinkSync(f);
-      fs.unlinkSync(listPath);
-      const leftovers = fs.readdirSync(jobDir);
-      for (const f of leftovers) fs.unlinkSync(path.join(jobDir, f));
-      fs.rmdirSync(jobDir);
-    } catch {}
+    // Cleanup temp (robust)
+    try { fs.rmSync(jobDir, { recursive: true, force: true }); } catch {}
 
     if (!pro) bumpCount(email);
 
@@ -488,4 +530,5 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 }
 
+// If memory is tight, consider lowering this to "50mb"
 export const config = { api: { bodyParser: { sizeLimit: "150mb" } } };
