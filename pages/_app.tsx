@@ -6,10 +6,21 @@ import "@/styles/globals.css";
 import Link from "next/link";
 import { useRouter } from "next/router";
 import { useState, useEffect } from "react";
+import Head from "next/head";
 
 export default function App({ Component, pageProps, router }: AppProps & any) {
   return (
     <SessionProvider session={pageProps?.session}>
+      <Head>
+        {/* SVG first (modern browsers) */}
+        <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+        {/* Fallbacks if you generated PNG/ICO */}
+        <link rel="icon" type="image/png" sizes="32x32" href="/icons/icon-32.png" />
+        <link rel="icon" type="image/png" sizes="16x16" href="/icons/icon-16.png" />
+        <link rel="apple-touch-icon" sizes="180x180" href="/icons/icon-180.png" />
+        <link rel="manifest" href="/site.webmanifest" />{/* optional */}
+        <meta name="theme-color" content="#ec4899" />
+      </Head>      
       <div className="min-h-screen">
         <TopNav />
         <main className="mx-auto max-w-6xl px-4 pb-16">
