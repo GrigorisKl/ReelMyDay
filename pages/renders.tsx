@@ -2,45 +2,40 @@
 import fs from "fs";
 import path from "path";
 import type { GetServerSideProps, GetServerSidePropsContext } from "next";
-import Link from "next/link";
 import { getServerSession } from "next-auth/next";
 import type { Session } from "next-auth";
 import { authOptions } from "./api/auth/[...nextauth]";
 
 type RenderItem = { url: string; createdAt: string; itemsCount: number };
 
-// Discriminated union for props
 type SignedOutProps = { signedOut: true };
 type SignedInProps  = { signedOut: false; items: RenderItem[] };
 type Props = SignedOutProps | SignedInProps;
 
-// Type guard to narrow to the signed-in branch
 function hasItems(p: Props): p is SignedInProps {
   return p.signedOut === false && Array.isArray((p as any).items);
 }
 
 export default function Renders(props: Props) {
   if (!hasItems(props)) {
-    // Signed-out UI
     return (
       <section className="mt-8">
         <div className="card p-6">
           <h1 className="text-2xl font-bold">Your Reels</h1>
           <p className="mt-2 text-black/70">Please sign in to view your private reels.</p>
           <div className="mt-4">
-            <Link
+            <a
               href="/api/auth/signin"
               className="inline-block rounded-2xl bg-pink-500 text-white px-4 py-2 font-medium hover:bg-pink-400"
             >
               Sign in
-            </Link>
+            </a>
           </div>
         </div>
       </section>
     );
   }
 
-  // From here on, TS knows props has `items`
   const files = props.items;
 
   return (
@@ -62,9 +57,9 @@ export default function Renders(props: Props) {
                     <a className="underline underline-offset-4" href={f.url} download>
                       Download
                     </a>
-                    <Link className="underline underline-offset-4" href={f.url} target="_blank">
+                    <a className="underline underline-offset-4" href={f.url} target="_blank" rel="noreferrer">
                       Open
-                    </Link>
+                    </a>
                   </div>
                 </div>
               </li>
@@ -76,17 +71,16 @@ export default function Renders(props: Props) {
   );
 }
 
-export const getServerSideProps: GetServerSideProps<Props> = async (
-  ctx: GetServerSidePropsContext
-) => {
+export const getServerSideProps: GetServerSideProps<Props> = async (ctx: GetServerSidePropsContext) => {
   const session = (await getServerSession(ctx.req, ctx.res, authOptions as any)) as Session | null;
   const email = session?.user?.email || null;
 
-  if (!email) {
-    return { props: { signedOut: true } };
-  }
+  if (!email) return { props: { signedOut: true } };
 
-  const dataPath = path.join(process.cwd(), "data", "renders.json");
+  const dataPath = fs.existsSync("/data")
+    ? "/data/renders.json"
+    : path.join(process.cwd(), "data", "renders.json");
+
   let items: RenderItem[] = [];
   try {
     if (fs.existsSync(dataPath)) {
@@ -95,9 +89,7 @@ export const getServerSideProps: GetServerSideProps<Props> = async (
         .filter((r) => String(r.email).toLowerCase() === email.toLowerCase())
         .sort((a, b) => (a.createdAt > b.createdAt ? -1 : 1));
     }
-  } catch {
-    // ignore parse/IO errors — fall back to empty list
-  }
+  } catch { /* ignore */ }
 
   return { props: { signedOut: false, items } };
 };

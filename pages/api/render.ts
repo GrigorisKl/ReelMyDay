@@ -3,9 +3,10 @@
    - Smooth Ken-Burns for images (constant foreground box; no jitter)
    - Blurred cover background (no black bars)
    - Video support (optional blur; keep/don’t keep original audio)
-   - Optional background music (mp3)
+   - Optional background music (mp3 OR a video-with-audio track)
    - Gating: one free export per user unless owner/Pro
    - DB persist of renders + auto-prune to latest 20 per user
+   - Persistent disk: writes to /data/renders and symlinks /public/renders -> /data/renders
 */
 
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -44,9 +45,9 @@ const PRESET = "veryfast";
 const CRF = "23";
 const SWS = "bicubic+accurate_rnd+full_chroma_int";
 
-// memory safety: cap captured ffmpeg output (avoid OOM)
+// cap ffmpeg output kept in memory
 const MAX_LOG = 5000;
-// control encoder threads to reduce memory spikes (default 1; raise if you have RAM)
+// limit threads to reduce memory spikes (can raise if you have more RAM)
 const FFMPEG_THREADS = Number(process.env.FFMPEG_THREADS || "1");
 
 // ---------- FS helpers ----------
@@ -55,36 +56,53 @@ function nowTs() { return Date.now(); }
 function seconds(n?: any, def = 3) { const v = Number(n); return Number.isFinite(v) && v > 0 ? v : def; }
 const fwd = (p: string) => p.replace(/\\/g, "/");
 
+// persistent renders root (/data/renders if available; else fallback to project public/renders)
+function getRendersRoot(): string {
+  const persistentRoot = "/data";
+  let root = path.join(process.cwd(), "public", "renders");
+  try {
+    if (fs.existsSync(persistentRoot)) {
+      const disk = path.join(persistentRoot, "renders");
+      ensureDir(disk);
+      // ensure public/renders is a symlink to /data/renders
+      const pubRenders = path.join(process.cwd(), "public", "renders");
+      const needsLink =
+        !fs.existsSync(pubRenders) ||
+        !fs.lstatSync(pubRenders).isSymbolicLink() ||
+        path.resolve(fs.readlinkSync(pubRenders)) !== path.resolve(disk);
+
+      if (needsLink) {
+        try {
+          if (fs.existsSync(pubRenders) && !fs.lstatSync(pubRenders).isSymbolicLink()) {
+            // remove empty dir if present
+            try { fs.rmdirSync(pubRenders); } catch {}
+          }
+        } catch {}
+        try { fs.symlinkSync(disk, pubRenders, "dir"); } catch {}
+      }
+      root = disk;
+    }
+  } catch { /* ignore */ }
+  ensureDir(root);
+  return root;
+}
+
 function run(bin: string, args: string[], cwd?: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const p = spawn(bin, args, { cwd, windowsHide: true });
 
-    let out = "";
-    let err = "";
+    let out = "", err = "";
+    p.stdout.on("data", (d) => { out += d.toString(); if (out.length > MAX_LOG) out = out.slice(-MAX_LOG); });
+    p.stderr.on("data", (d) => { err += d.toString(); if (err.length > MAX_LOG) err = err.slice(-MAX_LOG); });
 
-    p.stdout.on("data", (d) => {
-      out += d.toString();
-      if (out.length > MAX_LOG) out = out.slice(-MAX_LOG);
-    });
-    p.stderr.on("data", (d) => {
-      err += d.toString();
-      if (err.length > MAX_LOG) err = err.slice(-MAX_LOG);
-    });
-
-    p.on("close", (code) => {
-      if (code === 0) return resolve(out || err);
-      reject(new Error(`${bin} exited with ${code}\n${err}`));
-    });
+    p.on("close", (code) => code === 0 ? resolve(out || err) : reject(new Error(`${bin} exited with ${code}\n${err}`)));
   });
 }
-
 function runFF(args: string[]) {
   const bin = (ffmpegPath as string) || process.env.FFMPEG_PATH || "ffmpeg";
-  // Quiet flags first to reduce stderr volume
   const quiet = ["-hide_banner", "-loglevel", "error", "-nostats", "-nostdin"];
   return run(bin, [...quiet, ...args]);
 }
-
 function probe(input: string): Promise<{ width: number; height: number; rotation: number }> {
   const ffprobePath = (ffprobeMod as any)?.path || (ffprobeMod as any) || "ffprobe";
   const args = [
@@ -102,9 +120,7 @@ function probe(input: string): Promise<{ width: number; height: number; rotation
       const h = Number(s.height) || HEIGHT;
       const r = Number((s.tags && s.tags.rotate) || 0) || 0;
       return { width: w, height: h, rotation: r };
-    } catch {
-      return { width: WIDTH, height: HEIGHT, rotation: 0 };
-    }
+    } catch { return { width: WIDTH, height: HEIGHT, rotation: 0 }; }
   }).catch(() => ({ width: WIDTH, height: HEIGHT, rotation: 0 }));
 }
 
@@ -135,11 +151,8 @@ function decodeDataURL(data?: string): { mime: string; buf?: Buffer } {
   return { mime: m[1], buf: Buffer.from(m[2], "base64") };
 }
 function ensureRendersDir() {
-  const pub = path.join(process.cwd(), "public");
-  ensureDir(pub);
-  const renders = path.join(pub, "renders");
-  ensureDir(renders);
-  return renders;
+  const root = getRendersRoot(); // persistent if available
+  return root;
 }
 function saveIncomingItem(tmpDir: string, item: any, i: number): string {
   if (item?.dataUrl) {
@@ -162,18 +175,18 @@ function saveIncomingItem(tmpDir: string, item: any, i: number): string {
 }
 
 // ---------- Legacy usage (file-based) ----------
-const DATA_DIR = path.join(process.cwd(), "data");
+const DATA_DIR = fs.existsSync("/data") ? "/data" : path.join(process.cwd(), "data");
 const USAGE_FILE = path.join(DATA_DIR, "usage.json");
-const RENDERS_FILE = path.join(DATA_DIR, "renders.json");
+const RENDERS_LIST_FILE = path.join(DATA_DIR, "renders.json");
 function readJSON<T = any>(file: string, fallback: T): T {
   try {
-    ensureDir(DATA_DIR);
+    ensureDir(path.dirname(file));
     if (!fs.existsSync(file)) return fallback;
     return JSON.parse(fs.readFileSync(file, "utf8") || "null") ?? fallback;
   } catch { return fallback; }
 }
 function writeJSON(file: string, data: any) {
-  try { ensureDir(DATA_DIR); fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8"); } catch {}
+  try { ensureDir(path.dirname(file)); fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8"); } catch {}
 }
 function getCount(email: string): number {
   const m = readJSON<Record<string, number>>(USAGE_FILE, {});
@@ -186,9 +199,9 @@ function bumpCount(email: string) {
   writeJSON(USAGE_FILE, m);
 }
 function recordRender(email: string, url: string, itemsCount: number) {
-  const list = readJSON<any[]>(RENDERS_FILE, []);
+  const list = readJSON<any[]>(RENDERS_LIST_FILE, []);
   list.push({ email: email.toLowerCase(), url, itemsCount, createdAt: new Date().toISOString() });
-  writeJSON(RENDERS_FILE, list);
+  writeJSON(RENDERS_LIST_FILE, list);
 }
 
 // ---------- Math helpers ----------
@@ -287,13 +300,7 @@ function buildContainWithBlurVF(
 }
 
 // ---------- Segments ----------
-async function makeImageSegment(
-  inputPath: string,
-  outPath: string,
-  durSec: number,
-  bgBlur: boolean,
-  motion: Motion
-) {
+async function makeImageSegment(inputPath: string, outPath: string, durSec: number, bgBlur: boolean, motion: Motion) {
   const info = await probe(inputPath);
   const vf = buildContainWithBlurVF("image", durSec, motion, info.rotation, info.width, info.height, bgBlur !== false);
 
@@ -321,15 +328,11 @@ async function makeImageSegment(
   await runFF(args);
 }
 
-// Proper split graph for video: avoid referencing [0:v] twice without split
+// proper split for bg/fg so we don’t decode twice
 function baseFitVideo(bgBlur: boolean): string {
   if (!bgBlur) {
-    // just contain with possible padding
-    return `split=1[vx];` + // create a named stream to keep a consistent pattern
-           `[vx]scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=${SWS},` +
-           `pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`;
+    return `split=1[vx];[vx]scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=${SWS},pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`;
   }
-  // bg (cover+blur) and fit (contain) from a single split
   return [
     `split=2[vfit][vbg]`,
     `[vfit]scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=${SWS}[fit]`,
@@ -345,7 +348,6 @@ async function makeVideoSegment(
   bgBlur: boolean,
   trimToSec?: number
 ) {
-  // Build a filtergraph that starts with [0:v] and immediately splits
   const base = baseFitVideo(bgBlur);
   const vf = `[0:v]${base},fps=${FPS},format=yuv420p,setsar=1[v]`;
   const args: string[] = ["-y"];
@@ -356,11 +358,7 @@ async function makeVideoSegment(
     args.push(
       "-filter_complex", vf,
       "-map", "[v]", "-map", "0:a?",
-      "-c:v", "libx264",
-      "-preset", PRESET,
-      "-crf", CRF,
-      "-pix_fmt", "yuv420p",
-      "-r", String(FPS),
+      "-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-pix_fmt", "yuv420p", "-r", String(FPS),
       "-threads", String(Math.max(1, FFMPEG_THREADS)),
       "-c:a", "aac", "-ac", "2", "-ar", "44100", "-b:a", "160k",
       "-shortest",
@@ -371,11 +369,7 @@ async function makeVideoSegment(
       "-f", "lavfi", "-t", trimToSec ? String(trimToSec) : "9999", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
       "-filter_complex", vf,
       "-map", "[v]", "-map", "1:a",
-      "-c:v", "libx264",
-      "-preset", PRESET,
-      "-crf", CRF,
-      "-pix_fmt", "yuv420p",
-      "-r", String(FPS),
+      "-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-pix_fmt", "yuv420p", "-r", String(FPS),
       "-threads", String(Math.max(1, FFMPEG_THREADS)),
       "-c:a", "aac", "-ac", "2", "-ar", "44100", "-b:a", "160k",
       "-shortest",
@@ -385,22 +379,15 @@ async function makeVideoSegment(
   await runFF(args);
 }
 
-// ---------- Concat + music ----------
-async function writeConcatListAbsolute(fileList: string[], listPath: string) {
-  const lines = fileList.map((abs) => `file '${fwd(path.resolve(abs))}'`).join("\n");
-  fs.writeFileSync(listPath, lines, "utf8");
-}
-async function concatSegments(listPath: string, outPath: string) {
-  await runFF(["-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", outPath]);
-}
+// Replace video audio with music (music can be audio OR a video-with-audio)
 async function replaceAudioWithMusic(videoPath: string, musicPath: string): Promise<string> {
   const mixedPath = videoPath.replace(/\.mp4$/i, "-music.mp4");
   const args = [
     "-y",
-    "-stream_loop", "-1", "-i", musicPath,
-    "-i", videoPath,
-    "-map", "1:v:0",
-    "-map", "0:a:0",
+    "-i", videoPath,                 // 0 = video source
+    "-stream_loop", "-1", "-i", musicPath,  // 1 = music (audio or video-with-audio)
+    "-map", "0:v:0",
+    "-map", "1:a:0?",
     "-c:v", "copy",
     "-c:a", "aac", "-b:a", "192k",
     "-shortest",
@@ -446,9 +433,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(400).json({ ok: false, error: "no_items" });
     }
 
-    const rendersDir = ensureRendersDir();
+    const rendersRoot = ensureRendersDir();
     const jobId = String(nowTs());
-    const jobDir = path.join(rendersDir, `tmp-${jobId}`);
+    const jobDir = path.join(rendersRoot, `tmp-${jobId}`);
     ensureDir(jobDir);
 
     const segPaths: string[] = [];
@@ -470,7 +457,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     await writeConcatListAbsolute(segPaths, listPath);
 
     const outName = `reel-${jobId}.mp4`;
-    const outPath = path.join(rendersDir, outName);
+    const outPath = path.join(rendersRoot, outName);
     await concatSegments(listPath, outPath);
 
     let finalPath = outPath;
@@ -486,6 +473,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     if (!pro) bumpCount(email);
 
+    // Public URL always under /renders/...
     const relUrl = `/renders/${path.basename(finalPath)}`;
     recordRender(email, relUrl, items.length);
 
@@ -511,7 +499,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
         if (toDelete.length) {
           for (const r of toDelete) {
-            const pth = path.join(rendersDir, r.fileName);
+            const pth = path.join(rendersRoot, r.fileName);
             try { fs.unlinkSync(pth); } catch {}
           }
           await anyClient.render.deleteMany({
@@ -530,5 +518,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 }
 
-// If memory is tight, consider lowering this to "50mb"
+// allow large image dataURLs
 export const config = { api: { bodyParser: { sizeLimit: "150mb" } } };
+
+async function writeConcatListAbsolute(fileList: string[], listPath: string) {
+  const lines = fileList.map((abs) => `file '${fwd(path.resolve(abs))}'`).join("\n");
+  fs.writeFileSync(listPath, lines, "utf8");
+}
+async function concatSegments(listPath: string, outPath: string) {
+  await runFF(["-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", outPath]);
+}
