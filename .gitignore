@@ -1,0 +1,18 @@
+# Node/Next
+node_modules/
+.next/
+out/
+dist/
+*.log
+
+# Env & local data
+.env*
+!/env.example
+data/
+public/renders/
+prisma/dev.db
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/

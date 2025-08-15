@@ -1,0 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html { scroll-behavior: smooth; }
+body { @apply bg-gradient-to-br from-brand-start via-brand-mid to-brand-end min-h-screen text-slate-900; }
+.card { @apply rounded-3xl border border-white/30 bg-white/60 backdrop-blur-xl shadow-xl; }
