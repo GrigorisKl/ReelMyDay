@@ -125,7 +125,6 @@ export default function Pricing() {
               <li>• <strong>Unlimited exports</strong></li>
               <li>• Everything in Free</li>
               <li>• Per-user render history</li>
-              <li>• Future: Stripe billing & self-serve cancel (coming soon)</li>
             </ul>
 
             <div className="mt-4">
