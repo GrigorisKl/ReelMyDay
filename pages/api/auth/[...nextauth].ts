@@ -21,24 +21,23 @@ providers.push(
   Credentials({
     name: "Email",
     credentials: { email: { label: "Email" }, password: { label: "Password", type: "password" } },
-      async authorize(credentials) {
-        const email = String(credentials?.email || "").toLowerCase().trim();
-        const password = String(credentials?.password || "");
-        if (!email || !password) return null;
+    async authorize(credentials) {
+      const email = String(credentials?.email || "").toLowerCase().trim();
+      const password = String(credentials?.password || "");
+      if (!email || !password) return null;
 
-        const user = await prisma.user.findUnique({ where: { email } });
-        if (!user || !user.passwordHash) return null;
+      const user = await prisma.user.findUnique({ where: { email } });
+      if (!user || !user.passwordHash) return null;
 
-        const ok = await bcrypt.compare(password, user.passwordHash);
-        if (!ok) return null;
+      const ok = await bcrypt.compare(password, user.passwordHash);
+      if (!ok) return null;
 
-        // Optional: require verification
-        if (!user.emailVerified) {
-          throw new Error("Email not verified");
-        }
+      if (!user.emailVerified) {
+        throw new Error("Email not verified");
+      }
 
-        return { id: user.id, name: user.name || "", email: user.email, image: user.image || null };
-      },
+      return { id: user.id, name: user.name || "", email: user.email, image: user.image || null };
+    },
   })
 );
 
@@ -49,8 +48,23 @@ export const authOptions: NextAuthOptions = {
   providers,
   pages: { signIn: "/auth/signin" },
   callbacks: {
-    async jwt({ token, user }) { if (user) token.userId = (user as any).id ?? token.sub; return token; },
-    async session({ session, token }) { if (token?.userId) (session as any).userId = token.userId; return session; },
+    async jwt({ token, user }) {
+      if (user) token.userId = (user as any).id ?? token.sub;
+      const email = (token.email as string) || (user as any)?.email;
+      if (email) {
+        const u = await prisma.user.findUnique({
+          where: { email: email.toLowerCase() },
+          select: { isPro: true },
+        });
+        (token as any).isPro = !!u?.isPro;
+      }
+      return token;
+    },
+    async session({ session, token }) {
+      if (token?.userId) (session as any).userId = token.userId;
+      (session.user as any).isPro = (token as any).isPro ?? false;
+      return session;
+    },
   },
 };
 

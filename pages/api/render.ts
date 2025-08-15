@@ -1,14 +1,11 @@
 /* pages/api/render.ts
    Vertical reel renderer (1080x1920) with:
-   - SMOOTH Ken-Burns for images using constant foreground box (no jitter)
-   - Blurred "cover" background so landscape/portrait never show black bars
-   - Video support (optional blur, keep/don’t keep original audio)
-   - Optional background music (mp3, looped/trimmed to video)
-   - Gating: 1 free export per user; owner/isPro/active Stripe sub = unlimited
-   - Per-user render history in DB + auto-prune to latest 20 (deletes old files + DB rows)
-   - Legacy JSON writes kept for compatibility (not used for gating)
-
-   Requires: npm i ffmpeg-static ffprobe-static
+   - Smooth Ken-Burns for images (constant foreground box; no jitter)
+   - Blurred cover background (no black bars)
+   - Video support (optional blur; keep/don’t keep original audio)
+   - Optional background music (mp3)
+   - Gating: one free export per user unless owner/Pro
+   - DB persist of renders + auto-prune to latest 20 per user
 */
 
 import type { NextApiRequest, NextApiResponse } from "next";
@@ -22,16 +19,30 @@ import type { Session } from "next-auth";
 import { authOptions } from "./auth/[...nextauth]";
 import { prisma } from "../../lib/prisma";
 
-// ---------- Owner ----------
+// ---------- Owner / Pro ----------
 const OWNER_EMAIL = "grigoriskleanthous@gmail.com";
+function envProEmails(): Set<string> {
+  const s = (process.env.PRO_EMAILS || "")
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+  return new Set(s);
+}
+async function isProEmail(email: string) {
+  const e = (email || "").toLowerCase();
+  if (!e) return false;
+  if (e === OWNER_EMAIL.toLowerCase() || envProEmails().has(e)) return true;
+  const u = await prisma.user.findUnique({ where: { email: e }, select: { isPro: true } });
+  return !!u?.isPro;
+}
 
-// ---------- Render Tunables ----------
+// ---------- Tunables ----------
 const WIDTH = 1080;
 const HEIGHT = 1920;
-const FPS = 30;                  // 60 for even smoother (slower render)
+const FPS = 30;
 const PRESET = "veryfast";
 const CRF = "23";
-const SWS = "bicubic+accurate_rnd+full_chroma_int"; // high-quality scaler
+const SWS = "bicubic+accurate_rnd+full_chroma_int";
 
 // ---------- FS helpers ----------
 function ensureDir(p: string) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
@@ -128,8 +139,9 @@ function saveIncomingItem(tmpDir: string, item: any, i: number): string {
   throw new Error("missing_input");
 }
 
-// ---------- Legacy JSON (compat only; not used for gating) ----------
+// ---------- Legacy usage (file-based) ----------
 const DATA_DIR = path.join(process.cwd(), "data");
+const USAGE_FILE = path.join(DATA_DIR, "usage.json");
 const RENDERS_FILE = path.join(DATA_DIR, "renders.json");
 function readJSON<T = any>(file: string, fallback: T): T {
   try {
@@ -141,7 +153,17 @@ function readJSON<T = any>(file: string, fallback: T): T {
 function writeJSON(file: string, data: any) {
   try { ensureDir(DATA_DIR); fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8"); } catch {}
 }
-function recordRenderLegacy(email: string, url: string, itemsCount: number) {
+function getCount(email: string): number {
+  const m = readJSON<Record<string, number>>(USAGE_FILE, {});
+  return m[email.toLowerCase()] || 0;
+}
+function bumpCount(email: string) {
+  const key = email.toLowerCase();
+  const m = readJSON<Record<string, number>>(USAGE_FILE, {});
+  m[key] = (m[key] || 0) + 1;
+  writeJSON(USAGE_FILE, m);
+}
+function recordRender(email: string, url: string, itemsCount: number) {
   const list = readJSON<any[]>(RENDERS_FILE, []);
   list.push({ email: email.toLowerCase(), url, itemsCount, createdAt: new Date().toISOString() });
   writeJSON(RENDERS_FILE, list);
@@ -150,7 +172,6 @@ function recordRenderLegacy(email: string, url: string, itemsCount: number) {
 // ---------- Math helpers ----------
 function even(n: number) { return Math.max(2, Math.floor(n / 2) * 2); }
 function fitDims(srcW: number, srcH: number) {
-  // contain into WIDTH x HEIGHT
   const arSrc = srcW / srcH;
   const arOut = WIDTH / HEIGHT;
   if (arSrc >= arOut) {
@@ -167,7 +188,7 @@ function fitDims(srcW: number, srcH: number) {
 type Motion = "zoom_in" | "zoom_out" | "pan_left" | "pan_right" | "cover";
 type Kind = "image" | "video";
 
-// ---------- Constant-box Ken-Burns (no jitter) ----------
+// ---------- Smooth Ken-Burns (constant box, no jitter) ----------
 function buildContainWithBlurVF(
   kind: Kind,
   secondsDur: number,
@@ -181,7 +202,6 @@ function buildContainWithBlurVF(
   const rw = rotated ? srcH : srcW;
   const rh = rotated ? srcW : srcH;
 
-  // Foreground box that remains CONSTANT (prevents overlay jitter)
   const dims = fitDims(rw, rh);
   const fw = even(dims.fw);
   const fh = even(dims.fh);
@@ -189,10 +209,10 @@ function buildContainWithBlurVF(
   const frames = Math.max(2, Math.round(secondsDur * FPS));
   const maxIdx = frames - 1;
 
-  const DZ = 0.20; // total zoom range
-  const zin  = `1.00 + ${DZ.toFixed(2)}*(n/${maxIdx})`; // 1.00 -> 1.20
-  const zout = `1.20 - ${DZ.toFixed(2)}*(n/${maxIdx})`; // 1.20 -> 1.00
-  const zpan = `1.08`;                                  // headroom for pans
+  const DZ = 0.20;
+  const zin  = `1.00 + ${DZ.toFixed(2)}*(n/${maxIdx})`;
+  const zout = `1.20 - ${DZ.toFixed(2)}*(n/${maxIdx})`;
+  const zpan = `1.08`;
 
   const rotVF =
     rot === 90  ? "transpose=1," :
@@ -202,13 +222,21 @@ function buildContainWithBlurVF(
   let fgAnim: string;
   if (kind === "image") {
     if (motion === "zoom_in") {
-      fgAnim = `[fg0]scale=w='iw*(${zin})':h='ih*(${zin})':eval=frame,crop=${fw}:${fh}:x='(iw-ow)/2':y='(ih-oh)/2'[fgi]`;
+      fgAnim =
+        `[fg0]scale=w='iw*(${zin})':h='ih*(${zin})':eval=frame,` +
+        `crop=${fw}:${fh}:x='(iw-ow)/2':y='(ih-oh)/2'[fgi]`;
     } else if (motion === "zoom_out") {
-      fgAnim = `[fg0]scale=w='iw*(${zout})':h='ih*(${zout})':eval=frame,crop=${fw}:${fh}:x='(iw-ow)/2':y='(ih-oh)/2'[fgi]`;
+      fgAnim =
+        `[fg0]scale=w='iw*(${zout})':h='ih*(${zout})':eval=frame,` +
+        `crop=${fw}:${fh}:x='(iw-ow)/2':y='(ih-oh)/2'[fgi]`;
     } else if (motion === "pan_left") {
-      fgAnim = `[fg0]scale=w='iw*(${zpan})':h='ih*(${zpan})':eval=frame,crop=${fw}:${fh}:x='(iw-ow)/2 - (iw-ow)/2*(n/${maxIdx})':y='(ih-oh)/2'[fgi]`;
+      fgAnim =
+        `[fg0]scale=w='iw*(${zpan})':h='ih*(${zpan})':eval=frame,` +
+        `crop=${fw}:${fh}:x='(iw-ow)/2 - (iw-ow)/2*(n/${maxIdx})':y='(ih-oh)/2'[fgi]`;
     } else if (motion === "pan_right") {
-      fgAnim = `[fg0]scale=w='iw*(${zpan})':h='ih*(${zpan})':eval=frame,crop=${fw}:${fh}:x='(iw-ow)/2 + (iw-ow)/2*(n/${maxIdx})':y='(ih-oh)/2'[fgi]`;
+      fgAnim =
+        `[fg0]scale=w='iw*(${zpan})':h='ih*(${zpan})':eval=frame,` +
+        `crop=${fw}:${fh}:x='(iw-ow)/2 + (iw-ow)/2*(n/${maxIdx})':y='(ih-oh)/2'[fgi]`;
     } else {
       fgAnim = `[fg0]copy[fgi]`;
     }
@@ -236,7 +264,7 @@ function buildContainWithBlurVF(
   return vf;
 }
 
-// ---------- Segment builders ----------
+// ---------- Segments ----------
 async function makeImageSegment(
   inputPath: string,
   outPath: string,
@@ -253,7 +281,6 @@ async function makeImageSegment(
     "-framerate", String(FPS),
     "-t", String(durSec),
     "-i", inputPath,
-    // add silent stereo so concat works
     "-f", "lavfi", "-t", String(durSec), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
     "-filter_complex", vf + "[v]",
     "-map", "[v]",
@@ -344,18 +371,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const email = session?.user?.email || null;
   if (!email) return res.status(401).json({ ok: false, message: "Please sign in to export." });
 
-  // DB-based gating
-  const user = await prisma.user.findUnique({
-    where: { email: email.toLowerCase() },
-    select: { id: true, isPro: true, exportsUsed: true, stripeSubscriptionId: true },
-  });
-  if (!user) return res.status(401).json({ ok: false, message: "Please sign in to export." });
-
-  const isOwner = email.toLowerCase() === OWNER_EMAIL.toLowerCase();
-  const isPro = isOwner || !!user.isPro || !!user.stripeSubscriptionId;
-
-  if (!isPro && (user.exportsUsed ?? 0) >= 1) {
-    return res.status(402).json({ ok: false, message: "Free limit reached. Please subscribe to continue." });
+  const pro = await isProEmail(email);
+  if (!pro) {
+    const used = getCount(email);
+    if (used >= 1) {
+      return res.status(402).json({ ok: false, message: "Free limit reached. Please subscribe to continue." });
+    }
   }
 
   try {
@@ -378,13 +399,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       return res.status(400).json({ ok: false, error: "no_items" });
     }
 
-    // Prepare output dirs
-    const rendersAbs = ensureRendersDir();
+    const rendersDir = ensureRendersDir();
     const jobId = String(nowTs());
-    const jobDir = path.join(rendersAbs, `tmp-${jobId}`);
+    const jobDir = path.join(rendersDir, `tmp-${jobId}`);
     ensureDir(jobDir);
 
-    // Build each segment
     const segPaths: string[] = [];
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
@@ -400,15 +419,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       segPaths.push(seg);
     }
 
-    // Concat
     const listPath = path.join(jobDir, "concat.txt");
     await writeConcatListAbsolute(segPaths, listPath);
 
     const outName = `reel-${jobId}.mp4`;
-    const outPath = path.join(rendersAbs, outName);
+    const outPath = path.join(rendersDir, outName);
     await concatSegments(listPath, outPath);
 
-    // Optional background music (only if not keeping original video audio)
     let finalPath = outPath;
     if (bgMusicUrl && !keepVideoAudio) {
       let musicAbs = bgMusicUrl;
@@ -417,7 +434,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       try { fs.unlinkSync(outPath); } catch {}
     }
 
-    // Cleanup temp
     try {
       for (const f of segPaths) fs.unlinkSync(f);
       fs.unlinkSync(listPath);
@@ -426,45 +442,43 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       fs.rmdirSync(jobDir);
     } catch {}
 
+    if (!pro) bumpCount(email);
+
     const relUrl = `/renders/${path.basename(finalPath)}`;
+    recordRender(email, relUrl, items.length);
 
-    // Legacy JSON record (optional)
-    recordRenderLegacy(email, relUrl, items.length);
+    // DB persist + prune latest 20
+    try {
+      const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
+      const anyClient: any = prisma as any;
+      if (user && anyClient.render) {
+        const stat = fs.statSync(finalPath);
+        const fileName = path.basename(finalPath);
 
-    // Persist in DB
-    const stat = fs.statSync(finalPath);
-    const fileName = path.basename(finalPath);
-    await prisma.render.create({
-      data: {
-        userId: user.id,
-        fileName,
-        url: relUrl,
-        bytes: stat.size,
-      },
-    });
+        await anyClient.render.create({
+          data: { userId: user.id, fileName, url: relUrl, bytes: stat.size },
+        });
 
-    // Auto-prune to newest 20 per user (delete old files + DB rows)
-    const KEEP = 20;
-    const old = await prisma.render.findMany({
-      where: { userId: user.id },
-      orderBy: { createdAt: "desc" },
-      skip: KEEP,
-      select: { id: true, fileName: true },
-    });
-    if (old.length) {
-      for (const r of old) {
-        const pth = path.join(rendersAbs, r.fileName);
-        try { fs.unlinkSync(pth); } catch {}
+        const KEEP = 20;
+        const toDelete = await anyClient.render.findMany({
+          where: { userId: user.id },
+          orderBy: { createdAt: "desc" },
+          skip: KEEP,
+          select: { id: true, fileName: true },
+        });
+
+        if (toDelete.length) {
+          for (const r of toDelete) {
+            const pth = path.join(rendersDir, r.fileName);
+            try { fs.unlinkSync(pth); } catch {}
+          }
+          await anyClient.render.deleteMany({
+            where: { id: { in: toDelete.map((r: any) => r.id) } },
+          });
+        }
       }
-      await prisma.render.deleteMany({ where: { id: { in: old.map(r => r.id) } } });
-    }
-
-    // Increment free counter only for non-Pro users
-    if (!isPro) {
-      await prisma.user.update({
-        where: { id: user.id },
-        data: { exportsUsed: (user.exportsUsed ?? 0) + 1 },
-      });
+    } catch (dbErr) {
+      console.error("RENDER_DB_PERSIST_OR_PRUNE_FAIL", dbErr);
     }
 
     return res.json({ ok: true, url: relUrl });
@@ -474,5 +488,4 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 }
 
-// allow large image dataURLs
 export const config = { api: { bodyParser: { sizeLimit: "150mb" } } };
