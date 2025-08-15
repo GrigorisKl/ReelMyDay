@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import crypto from "node:crypto";
 import { prisma } from "../../../lib/prisma";
-import { sendMail } from "../../../lib/mailer";
+import { sendMailSafe } from "../../../lib/mailer";
 
 const RESET_TTL_MIN = 60; // token valid for 60 minutes
 
@@ -31,7 +31,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const base = process.env.NEXTAUTH_URL || "http://localhost:3000";
   const resetUrl = `${base}/reset?token=${encodeURIComponent(raw)}&email=${encodeURIComponent(normalized)}`;
 
-  await sendMail({
+  await sendMailSafe({
     to: normalized,
     subject: "Reset your ReelMyDay password",
     html: `<p>We received a request to reset your password.</p>
