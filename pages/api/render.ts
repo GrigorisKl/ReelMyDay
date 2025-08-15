@@ -1,28 +1,80 @@
-/* pages/api/render.ts
-   Vertical reel renderer (1080x1920) with:
-   - Smooth Ken-Burns for images (constant foreground box; no jitter)
-   - Blurred cover background (no black bars)
-   - Video support (optional blur; keep/don’t keep original audio)
-   - Optional background music (AUDIO FILES ONLY — mp3, m4a, wav, etc.)
-   - Gating: one free export per user unless owner/Pro
-   - DB persist of renders + auto-prune to latest 20 per user
-   - Persistent disk: writes to /data/renders and ALWAYS copies final mp4 to /public/renders
-   - Optional auto-duration: match total length to bgMusic duration for images
-*/
-
+// pages/api/render.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
 import ffmpegPath from "ffmpeg-static";
 import ffprobeMod from "ffprobe-static";
+import sharp from "sharp";
 import { getServerSession } from "next-auth/next";
 import type { Session } from "next-auth";
 import { authOptions } from "./auth/[...nextauth]";
 import { prisma } from "../../lib/prisma";
 
-// -------- owner / pro ----------
+/** ---------- Constants ---------- */
 const OWNER_EMAIL = "grigoriskleanthous@gmail.com";
+const WIDTH = 1080;
+const HEIGHT = 1920;
+const FPS = 30;
+const PRESET = "veryfast";
+const CRF = "23";
+const SWS = "bicubic+accurate_rnd+full_chroma_int"; // good scaler
+
+/** ---------- Helpers ---------- */
+const binFFMPEG = (ffmpegPath as string) || process.env.FFMPEG_PATH || "ffmpeg";
+const binFFPROBE = (ffprobeMod as any)?.path || (ffprobeMod as any) || "ffprobe";
+const fwd = (p: string) => p.replace(/\\/g, "/");
+function ensureDir(p: string) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
+function nowTs() { return Date.now(); }
+function even(n: number) { return Math.max(2, Math.floor(n / 2) * 2); }
+function seconds(n?: any, def = 3) { const v = Number(n); return Number.isFinite(v) && v > 0 ? v : def; }
+
+function run(bin: string, args: string[], cwd?: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const p = spawn(bin, args, { cwd, windowsHide: true });
+    let out = ""; let err = "";
+    p.stdout.on("data", d => (out += d.toString()));
+    p.stderr.on("data", d => (err += d.toString()));
+    p.on("close", (code) => (code === 0 ? resolve(out || err) : reject(new Error(`${bin} exited ${code}\n${err}`))));
+  });
+}
+const runFF = (args: string[]) => run(binFFMPEG, args);
+
+async function probeJson(input: string): Promise<any> {
+  const args = [
+    "-v", "error",
+    "-print_format", "json",
+    "-show_streams",
+    "-show_format",
+    input,
+  ];
+  const txt = await run(binFFPROBE, args);
+  try { return JSON.parse(txt); } catch { return {}; }
+}
+
+function isLikelyHDR(meta: any): boolean {
+  const v = (meta?.streams || []).find((s: any) => s.codec_type === "video") || {};
+  const prim = String(v.color_primaries || v.tags?.color_primaries || "").toLowerCase();
+  const trn  = String(v.color_transfer || v.tags?.color_transfer || "").toLowerCase();
+  const spc  = String(v.color_space || v.tags?.color_space || "").toLowerCase();
+  const pix  = String(v.pix_fmt || "").toLowerCase();
+  // bt2020 + smpte2084 (PQ) or HLG and 10-bit pixel formats are good signals
+  return /2020/.test(prim + spc) || /2084|hlg|arib-std-b67/.test(trn) || /p10|yuv420p10|yuv422p10/.test(pix);
+}
+
+function ensureRendersDir() {
+  const pub = path.join(process.cwd(), "public");
+  ensureDir(pub);
+  const renders = path.join(pub, "renders");
+  ensureDir(renders);
+  return renders;
+}
+
+function isPro(email: string, proList: Set<string>) {
+  const e = (email || "").toLowerCase();
+  return !!e && (e === OWNER_EMAIL || proList.has(e));
+}
+
 function envProEmails(): Set<string> {
   const s = (process.env.PRO_EMAILS || "")
     .split(",")
@@ -30,187 +82,94 @@ function envProEmails(): Set<string> {
     .filter(Boolean);
   return new Set(s);
 }
-async function isProEmail(email: string) {
-  const e = (email || "").toLowerCase();
-  if (!e) return false;
-  if (e === OWNER_EMAIL.toLowerCase() || envProEmails().has(e)) return true;
-  const u = await prisma.user.findUnique({ where: { email: e }, select: { isPro: true } });
-  return !!u?.isPro;
-}
 
-// -------- tunables ----------
-const WIDTH = 1080;
-const HEIGHT = 1920;
-const FPS = 30;
-const PRESET = "veryfast";
-const CRF = "23";
-const SWS = "bicubic+accurate_rnd+full_chroma_int";
-const FFMPEG_THREADS = Number(process.env.FFMPEG_THREADS || "1");
-const MAX_LOG = 6000;
-
-// -------- fs helpers ----------
-function ensureDir(p: string) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
-function nowTs() { return Date.now(); }
-function seconds(n?: any, def = 3) { const v = Number(n); return Number.isFinite(v) && v > 0 ? v : def; }
-const fwd = (p: string) => p.replace(/\\/g, "/");
-
-// persistent renders root and public path
-function getRendersRoot(): { diskRoot: string; publicRoot: string } {
-  const diskRoot = fs.existsSync("/data") ? "/data/renders" : path.join(process.cwd(), "public", "renders");
-  const publicRoot = path.join(process.cwd(), "public", "renders");
-  ensureDir(diskRoot);
-  ensureDir(publicRoot);
-
-  // best-effort symlink (harmless if it fails)
-  try {
-    const isLink = fs.existsSync(publicRoot) && fs.lstatSync(publicRoot).isSymbolicLink();
-    const target = isLink ? path.resolve(fs.readlinkSync(publicRoot)) : "";
-    if (!isLink || target !== path.resolve(diskRoot)) {
-      try { if (fs.existsSync(publicRoot) && !isLink) fs.rmdirSync(publicRoot); } catch {}
-      try { fs.symlinkSync(diskRoot, publicRoot, "dir"); } catch {}
-    }
-  } catch { /* ignore */ }
-
-  return { diskRoot, publicRoot };
-}
-
-function run(bin: string, args: string[], cwd?: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const p = spawn(bin, args, { cwd, windowsHide: true });
-    let out = "", err = "";
-    p.stdout.on("data", d => { out += d.toString(); if (out.length > MAX_LOG) out = out.slice(-MAX_LOG); });
-    p.stderr.on("data", d => { err += d.toString(); if (err.length > MAX_LOG) err = err.slice(-MAX_LOG); });
-    p.on("close", code => code === 0 ? resolve(out || err) : reject(new Error(`${bin} exited with ${code}\n${err}`)));
-  });
-}
-function runFF(args: string[]) {
-  const bin = (ffmpegPath as string) || process.env.FFMPEG_PATH || "ffmpeg";
-  const quiet = ["-hide_banner", "-loglevel", "error", "-nostats", "-nostdin"];
-  return run(bin, [...quiet, ...args]);
-}
-
-// probe helpers
-async function ffprobeJson(input: string): Promise<any> {
-  const ffprobePath = (ffprobeMod as any)?.path || (ffprobeMod as any) || "ffprobe";
-  const args = ["-v", "error", "-show_streams", "-show_format", "-print_format", "json", input];
-  try { return JSON.parse(await run(ffprobePath, args) || "{}"); } catch { return {}; }
-}
-async function probeVideoDims(input: string): Promise<{ width: number; height: number; rotation: number }> {
-  const info = await ffprobeJson(input);
-  const vs = (info.streams || []).find((s: any) => s.codec_type === "video") || {};
-  const w = Number(vs.width) || WIDTH;
-  const h = Number(vs.height) || HEIGHT;
-  const r = Number((vs.tags && vs.tags.rotate) || 0) || 0;
-  return { width: w, height: h, rotation: r };
-}
-async function probeDurationSec(input: string): Promise<number> {
-  const info = await ffprobeJson(input);
-  const d = Number(info.format?.duration);
-  return Number.isFinite(d) ? d : 0;
-}
-
-// image normalisation (fix iPhone HEIC/HDR etc.)
-let sharpMod: any = null;
-try { sharpMod = require("sharp"); } catch { sharpMod = null; }
-
-const IMAGE_EXTS = [".png",".jpg",".jpeg",".webp",".heic",".heif",".avif",".jxl",".bmp",".tiff"];
-function looksLikeImage(p: string) { return IMAGE_EXTS.includes(path.extname(p).toLowerCase()); }
-
-async function normalizeStillToPng(inPath: string, outPath: string) {
-  if (!sharpMod) {
-    // if sharp missing, just copy; ffmpeg may still read common formats
-    fs.copyFileSync(inPath, outPath);
-    return;
+/** ---------- File intake ---------- */
+function guessExt(name?: string, mime?: string) {
+  if (mime?.startsWith("image/")) {
+    if (/heic|heif/i.test(mime) || /\.heic$|\.heif$/i.test(name || "")) return ".heic";
+    if (/png/i.test(mime)) return ".png";
+    if (/jpeg|jpg/i.test(mime)) return ".jpg";
+    if (/webp/i.test(mime)) return ".webp";
+    return ".png";
   }
-  await sharpMod(inPath)
-    .rotate()                 // honour EXIF orientation
-    .resize(3000, 3000, { fit: "inside", withoutEnlargement: true }) // keep memory sane
-    .toColourspace("srgb")
-    .png({ compressionLevel: 8 })
-    .toFile(outPath);
+  if (mime?.startsWith("video/")) {
+    if (/mp4/i.test(mime)) return ".mp4";
+    if (/quicktime/i.test(mime)) return ".mov";
+    if (/webm/i.test(mime)) return ".webm";
+    return ".mp4";
+  }
+  if (mime?.startsWith("audio/")) return ".mp3";
+  const ext = path.extname(name || "");
+  return ext || ".bin";
 }
 
-async function saveIncomingItem(tmpDir: string, item: any, i: number): Promise<string> {
-  // write to tmp
-  let out = path.join(tmpDir, `in-${i}`);
+function decodeDataURL(data?: string): { mime: string; buf?: Buffer } {
+  if (!data) return { mime: "" };
+  const m = /^data:(.+?);base64,(.+)$/i.exec(data);
+  if (!m) return { mime: "", buf: undefined };
+  return { mime: m[1], buf: Buffer.from(m[2], "base64") };
+}
+
+/** Save any incoming item (image/video/audio) to tmp folder */
+function saveIncomingItem(tmpDir: string, item: any, i: number): string {
   if (item?.dataUrl) {
-    const m = /^data:(.+?);base64,(.+)$/i.exec(item.dataUrl || "");
-    if (!m) throw new Error("bad_data_url");
-    const mime = m[1]; const buf = Buffer.from(m[2], "base64");
-    const ext = mime.startsWith("image/") ? ".png"
-              : mime.startsWith("video/") ? ".mp4"
-              : mime.startsWith("audio/") ? ".mp3" : ".bin";
-    out += ext;
+    const { mime, buf } = decodeDataURL(item.dataUrl);
+    if (!buf?.length) throw new Error("bad_data_url");
+    const ext = guessExt(item.name, mime);
+    const out = path.join(tmpDir, `in-${i}${ext}`);
     fs.writeFileSync(out, buf);
-  } else if (item?.url) {
-    let src = String(item.url);
+    return out;
+  }
+  if (item?.url) {
+    // server-side path (only if you pass server-relative URLs)
+    let src = item.url as string;
     if (src.startsWith("/")) src = path.join(process.cwd(), "public", src);
-    const ext = path.extname(item.name || src) || ".bin";
-    out += ext;
+    const ext = guessExt(item.name, item.mime);
+    const out = path.join(tmpDir, `in-${i}${ext}`);
     fs.copyFileSync(src, out);
-  } else {
-    throw new Error("missing_input");
+    return out;
   }
-
-  // normalise stills → PNG so HEIC/HDR don't break ffmpeg
-  if (looksLikeImage(out)) {
-    const png = path.join(tmpDir, `still-${i}.png`);
-    await normalizeStillToPng(out, png);
-    return png;
-  }
-  return out;
+  throw new Error("missing_input");
 }
 
-// legacy usage json (kept)
-const DATA_FILE_ROOT = fs.existsSync("/data") ? "/data" : path.join(process.cwd(), "data");
-const USAGE_FILE = path.join(DATA_FILE_ROOT, "usage.json");
-const RENDERS_LIST_FILE = path.join(DATA_FILE_ROOT, "renders.json");
-function readJSON<T = any>(file: string, fallback: T): T {
-  try { ensureDir(path.dirname(file)); if (!fs.existsSync(file)) return fallback;
-    return JSON.parse(fs.readFileSync(file, "utf8") || "null") ?? fallback;
-  } catch { return fallback; }
-}
-function writeJSON(file: string, data: any) {
-  try { ensureDir(path.dirname(file)); fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8"); } catch {}
-}
-function getCount(email: string): number {
-  const m = readJSON<Record<string, number>>(USAGE_FILE, {}); return m[email.toLowerCase()] || 0;
-}
-function bumpCount(email: string) {
-  const key = email.toLowerCase(); const m = readJSON<Record<string, number>>(USAGE_FILE, {});
-  m[key] = (m[key] || 0) + 1; writeJSON(USAGE_FILE, m);
-}
-function recordRender(email: string, url: string, itemsCount: number) {
-  const list = readJSON<any[]>(RENDERS_LIST_FILE, []);
-  list.push({ email: email.toLowerCase(), url, itemsCount, createdAt: new Date().toISOString() });
-  writeJSON(RENDERS_LIST_FILE, list);
+/** Convert HEIC/HDR stills to an SDR PNG that ffmpeg loves */
+async function normalizeStill(inputPath: string, outPng: string) {
+  const buf = await sharp(inputPath).withMetadata().png({ quality: 95 }).toBuffer();
+  fs.writeFileSync(outPng, buf);
 }
 
-// ---------- math ----------
-function even(n: number) { return Math.max(2, Math.floor(n / 2) * 2); }
+/** ---------- Math / layout ---------- */
 function fitDims(srcW: number, srcH: number) {
-  const arSrc = srcW / srcH, arOut = WIDTH / HEIGHT;
+  const arSrc = srcW / srcH;
+  const arOut = WIDTH / HEIGHT;
   if (arSrc >= arOut) {
-    const fw = WIDTH, fh = even(Math.round(WIDTH / arSrc));
+    const fw = WIDTH;
+    const fh = even(Math.round(WIDTH / arSrc));
     return { fw, fh };
   } else {
-    const fh = HEIGHT, fw = even(Math.round(HEIGHT * arSrc));
+    const fh = HEIGHT;
+    const fw = even(Math.round(HEIGHT * arSrc));
     return { fw, fh };
   }
 }
 
-type Motion = "zoom_in" | "zoom_out" | "pan_left" | "pan_right" | "cover";
-type Kind = "image" | "video";
-
-// ---------- smooth ken-burns ----------
+/** Build smooth Ken-Burns inside a constant box */
 function buildContainWithBlurVF(
-  kind: Kind, secondsDur: number, motion: Motion, rot: number, srcW: number, srcH: number, useBlur: boolean
+  kind: "image" | "video",
+  secondsDur: number,
+  motion: "zoom_in" | "zoom_out" | "pan_left" | "pan_right" | "cover",
+  rot: number,
+  srcW: number,
+  srcH: number,
+  useBlur: boolean
 ) {
   const rotated = rot === 90 || rot === 270;
   const rw = rotated ? srcH : srcW;
   const rh = rotated ? srcW : srcH;
+
   const dims = fitDims(rw, rh);
-  const fw = even(dims.fw), fh = even(dims.fh);
+  const fw = even(dims.fw);
+  const fh = even(dims.fh);
 
   const frames = Math.max(2, Math.round(secondsDur * FPS));
   const maxIdx = frames - 1;
@@ -220,7 +179,10 @@ function buildContainWithBlurVF(
   const zout = `1.20 - ${DZ.toFixed(2)}*(n/${maxIdx})`;
   const zpan = `1.08`;
 
-  const rotVF = rot === 90 ? "transpose=1," : rot === 180 ? "transpose=1,transpose=1," : rot === 270 ? "transpose=2," : "";
+  const rotVF =
+    rot === 90  ? "transpose=1," :
+    rot === 180 ? "transpose=1,transpose=1," :
+    rot === 270 ? "transpose=2," : "";
 
   let fgAnim: string;
   if (kind === "image") {
@@ -246,118 +208,176 @@ function buildContainWithBlurVF(
     ? `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase:flags=${SWS},crop=${WIDTH}:${HEIGHT},gblur=sigma=36`
     : `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase:flags=${SWS},crop=${WIDTH}:${HEIGHT}`;
 
-  const vf =
+  return (
     `${rotVF}setsar=1,split=2[bg][fg];` +
     `[bg]${bgBase},setsar=1[bg];` +
     `[fg]scale=${fw}:${fh},setsar=1[fg0];` +
     `${fgAnim};` +
     `[bg][fgi]overlay=x='(W-w)/2':y='(H-h)/2',` +
-    `fade=t=in:st=0:d=${fin},` +
-    `fade=t=out:st=${(secondsDur - fout).toFixed(2)}:d=${fout},` +
-    `fps=${FPS},format=yuv420p`;
-
-  return vf;
+    `fade=t=in:st=0:d=${fin},fade=t=out:st=${(secondsDur - fout).toFixed(2)}:d=${fout},` +
+    `fps=${FPS},format=yuv420p`
+  );
 }
 
-// ---------- segments ----------
-async function makeImageSegment(inputPath: string, outPath: string, durSec: number, bgBlur: boolean, motion: Motion) {
-  const info = await probeVideoDims(inputPath);
-  const vf = buildContainWithBlurVF("image", durSec, motion, info.rotation, info.width, info.height, bgBlur !== false);
+/** ---------- Segment writers ---------- */
+async function makeImageSegment(inputPath: string, outPath: string, durSec: number, bgBlur: boolean, motion: any) {
+  // Normalize HEIC/HDR stills -> PNG (SDR)
+  const ext = path.extname(inputPath).toLowerCase();
+  let still = inputPath;
+  if (ext === ".heic" || ext === ".heif") {
+    still = inputPath.replace(ext, ".png");
+    await normalizeStill(inputPath, still);
+  }
+
+  // Probe (size + rotation)
+  const meta = await probeJson(still);
+  const v = (meta.streams || [])[0] || {};
+  const rot = Number(v.tags?.rotate || v.side_data_list?.[0]?.rotation || 0) || 0;
+  const w = Number(v.width || 2000);
+  const h = Number(v.height || 2000);
+
+  const vf = buildContainWithBlurVF("image", durSec, motion, rot, w, h, bgBlur !== false);
   const args = [
     "-y",
-    "-loop", "1", "-framerate", String(FPS), "-t", String(durSec),
-    "-i", inputPath,
+    "-loop", "1",
+    "-framerate", String(FPS),
+    "-t", String(durSec),
+    "-i", still,
     "-f", "lavfi", "-t", String(durSec), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
     "-filter_complex", vf + "[v]",
-    "-map", "[v]", "-map", "1:a",
-    "-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-pix_fmt", "yuv420p", "-r", String(FPS),
-    "-threads", String(Math.max(1, FFMPEG_THREADS)),
+    "-map", "[v]",
+    "-map", "1:a",
+    "-c:v", "libx264",
+    "-preset", PRESET,
+    "-crf", CRF,
+    "-pix_fmt", "yuv420p",
+    "-r", String(FPS),
     "-c:a", "aac", "-b:a", "160k",
-    "-shortest", outPath,
+    "-movflags", "+faststart",
+    "-threads", "1",
+    "-shortest",
+    outPath,
   ];
   await runFF(args);
 }
 
-function baseFitVideo(bgBlur: boolean): string {
-  if (!bgBlur) {
-    return `split=1[vx];[vx]scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=${SWS},pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2`;
-  }
+function baseFitVideo(bgBlur: boolean, toneMap: boolean): string {
+  const cover = bgBlur
+    ? `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase:flags=${SWS},crop=${WIDTH}:${HEIGHT},gblur=sigma=36`
+    : `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase:flags=${SWS},crop=${WIDTH}:${HEIGHT}`;
+
+  // tone-map HDR to SDR (bt709) if needed
+  const tone = toneMap
+    ? ",zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,format=yuv420p"
+    : "";
+
   return [
-    `split=2[vfit][vbg]`,
-    `[vfit]scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=${SWS}[fit]`,
-    `[vbg]scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase:flags=${SWS},crop=${WIDTH}:${HEIGHT},gblur=sigma=36[bg]`,
+    // foreground (fit inside 1080x1920)
+    `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease:flags=${SWS}${tone}[fit]`,
+    // background
+    `[0:v]${cover}[bg]`,
+    // compose
     `[bg][fit]overlay=(W-w)/2:(H-h)/2`,
   ].join(";");
 }
 
 async function makeVideoSegment(
-  inputPath: string, outPath: string, keepAudio: boolean, bgBlur: boolean, trimToSec?: number
+  inputPath: string,
+  outPath: string,
+  keepAudio: boolean,
+  bgBlur: boolean,
+  trimToSec?: number
 ) {
-  const base = baseFitVideo(bgBlur);
-  const vf = `[0:v]${base},fps=${FPS},format=yuv420p,setsar=1[v]`;
+  const meta = await probeJson(inputPath);
+  const toneMap = isLikelyHDR(meta);
+  const vf = baseFitVideo(bgBlur, toneMap) + `,fps=${FPS},format=yuv420p,setsar=1`;
+
   const args: string[] = ["-y"];
   if (trimToSec && trimToSec > 0) args.push("-t", String(trimToSec));
   args.push("-i", inputPath);
 
   if (keepAudio) {
     args.push(
-      "-filter_complex", vf,
-      "-map", "[v]", "-map", "0:a?",
-      "-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-pix_fmt", "yuv420p", "-r", String(FPS),
-      "-threads", String(Math.max(1, FFMPEG_THREADS)),
+      "-filter_complex", vf + "[v]",
+      "-map", "[v]",
+      "-map", "0:a?",
+      "-c:v", "libx264",
+      "-preset", PRESET,
+      "-crf", CRF,
+      "-pix_fmt", "yuv420p",
+      "-r", String(FPS),
       "-c:a", "aac", "-ac", "2", "-ar", "44100", "-b:a", "160k",
-      "-shortest", outPath
+      "-movflags", "+faststart",
+      "-threads", "1",
+      "-shortest",
+      outPath
     );
   } else {
     args.push(
       "-f", "lavfi", "-t", trimToSec ? String(trimToSec) : "9999", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-      "-filter_complex", vf,
-      "-map", "[v]", "-map", "1:a",
-      "-c:v", "libx264", "-preset", PRESET, "-crf", CRF, "-pix_fmt", "yuv420p", "-r", String(FPS),
-      "-threads", String(Math.max(1, FFMPEG_THREADS)),
+      "-filter_complex", vf + "[v]",
+      "-map", "[v]",
+      "-map", "1:a",
+      "-c:v", "libx264",
+      "-preset", PRESET,
+      "-crf", CRF,
+      "-pix_fmt", "yuv420p",
+      "-r", String(FPS),
       "-c:a", "aac", "-ac", "2", "-ar", "44100", "-b:a", "160k",
-      "-shortest", outPath
+      "-movflags", "+faststart",
+      "-threads", "1",
+      "-shortest",
+      outPath
     );
   }
   await runFF(args);
 }
 
-// create concat list
+/** concat list writer */
 async function writeConcatListAbsolute(fileList: string[], listPath: string) {
   const lines = fileList.map((abs) => `file '${fwd(path.resolve(abs))}'`).join("\n");
   fs.writeFileSync(listPath, lines, "utf8");
 }
 async function concatSegments(listPath: string, outPath: string) {
-  await runFF(["-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", outPath]);
+  await runFF(["-y", "-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", "-movflags", "+faststart", outPath]);
 }
-
-// strictly audio music only (reject video sources)
-async function validateMusicIsAudio(musicPath: string) {
-  const info = await ffprobeJson(musicPath);
-  const hasVideo = (info.streams || []).some((s: any) => s.codec_type === "video");
-  const hasAudio = (info.streams || []).some((s: any) => s.codec_type === "audio");
-  if (!hasAudio || hasVideo) throw new Error("music_must_be_audio");
-}
-
 async function replaceAudioWithMusic(videoPath: string, musicPath: string): Promise<string> {
-  await validateMusicIsAudio(musicPath); // will throw if not pure audio
   const mixedPath = videoPath.replace(/\.mp4$/i, "-music.mp4");
-  const args = [
+  await runFF([
     "-y",
-    "-i", videoPath,   // 0: video (and maybe audio, but we replace)
-    "-stream_loop", "-1", "-i", musicPath, // 1: pure audio
-    "-map", "0:v:0",
-    "-map", "1:a:0",
+    "-stream_loop", "-1", "-i", musicPath,
+    "-i", videoPath,
+    "-map", "1:v:0",
+    "-map", "0:a:0",
     "-c:v", "copy",
     "-c:a", "aac", "-b:a", "192k",
+    "-movflags", "+faststart",
     "-shortest",
     mixedPath,
-  ];
-  await runFF(args);
+  ]);
   return mixedPath;
 }
 
-// ---------- handler ----------
+/** ---------- File-based usage cap (kept) ---------- */
+const DATA_DIR = path.join(process.cwd(), "data");
+const USAGE_FILE = path.join(DATA_DIR, "usage.json");
+const RENDERS_FILE = path.join(DATA_DIR, "renders.json");
+function readJSON<T = any>(file: string, fallback: T): T {
+  try { ensureDir(DATA_DIR); if (!fs.existsSync(file)) return fallback; return JSON.parse(fs.readFileSync(file, "utf8") || "null") ?? fallback; }
+  catch { return fallback; }
+}
+function writeJSON(file: string, data: any) { try { ensureDir(DATA_DIR); fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8"); } catch {} }
+function getCount(email: string): number { const m = readJSON<Record<string, number>>(USAGE_FILE, {}); return m[email.toLowerCase()] || 0; }
+function bumpCount(email: string) { const key = email.toLowerCase(); const m = readJSON<Record<string, number>>(USAGE_FILE, {}); m[key] = (m[key] || 0) + 1; writeJSON(USAGE_FILE, m); }
+function recordRender(email: string, url: string, itemsCount: number) {
+  const list = readJSON<any[]>(RENDERS_FILE, []);
+  list.push({ email: email.toLowerCase(), url, itemsCount, createdAt: new Date().toISOString() });
+  writeJSON(RENDITION_FILE, list);
+}
+// fix: correct path variable name
+const RENDITION_FILE = RENDERS_FILE;
+
+/** ---------- API ---------- */
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "POST") return res.status(405).end();
 
@@ -365,12 +385,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const email = session?.user?.email || null;
   if (!email) return res.status(401).json({ ok: false, message: "Please sign in to export." });
 
-  const pro = await isProEmail(email);
+  const pro = isPro(email, envProEmails());
   if (!pro) {
     const used = getCount(email);
-    if (used >= 1) {
-      return res.status(402).json({ ok: false, message: "Free limit reached. Please subscribe to continue." });
-    }
+    if (used >= 1) return res.status(402).json({ ok: false, message: "Free limit reached. Please subscribe to continue." });
   }
 
   try {
@@ -381,114 +399,119 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       keepVideoAudio = true,
       bgBlur = true,
       motion = "zoom_in",
-      bgMusicUrl = "",
-      matchMusicDuration = false, // NEW: adjust per-image durations to match music length
+      music,                      // NEW: { name, dataUrl } or undefined
+      matchMusicDuration = false, // NEW: clamp reel ≤ music length
     } = (req.body || {}) as {
       items: Array<{ name?: string; mime?: string; dataUrl?: string; url?: string }>;
       durationSec?: number; maxPerVideoSec?: number;
-      keepVideoAudio?: boolean; bgBlur?: boolean; motion?: Motion;
-      bgMusicUrl?: string; matchMusicDuration?: boolean;
+      keepVideoAudio?: boolean; bgBlur?: boolean; motion?: any;
+      music?: { name?: string; dataUrl?: string };
+      matchMusicDuration?: boolean;
     };
 
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ ok: false, error: "no_items" });
     }
 
-    const { diskRoot, publicRoot } = getRendersRoot();
+    // workspace
+    const rendersDir = ensureRendersDir();
     const jobId = String(nowTs());
-    const jobDir = path.join(diskRoot, `tmp-${jobId}`);
+    const jobDir = path.join(rendersDir, `tmp-${jobId}`);
     ensureDir(jobDir);
 
-    // Save + normalise inputs
-    const inputPaths: string[] = [];
-    for (let i = 0; i < items.length; i++) {
-      inputPaths.push(await saveIncomingItem(jobDir, items[i], i));
-    }
-
-    // If matching music duration: compute durations for images
-    let perImageDur = seconds(durationSec, 2.5);
-    let videoTrim = seconds(maxPerVideoSec, 0) || undefined;
-
-    if (matchMusicDuration && bgMusicUrl) {
-      let musicAbs = bgMusicUrl;
-      if (musicAbs.startsWith("/")) musicAbs = path.join(process.cwd(), "public", musicAbs);
-      await validateMusicIsAudio(musicAbs); // ensure it is audio
-
-      const musicLen = await probeDurationSec(musicAbs); // seconds
-      if (musicLen > 0) {
-        // total length of videos (after trim)
-        let totalVid = 0;
-        const imgIdx: number[] = [];
-        for (let i = 0; i < inputPaths.length; i++) {
-          const p = inputPaths[i];
-          if (looksLikeImage(p)) {
-            imgIdx.push(i);
-          } else {
-            const d = await probeDurationSec(p);
-            totalVid += Math.min(d || 0, videoTrim || d || 0);
-          }
-        }
-        const remain = Math.max(0, musicLen - totalVid);
-        const nImgs = imgIdx.length;
-        if (nImgs > 0 && remain > 0.5) {
-          perImageDur = Math.max(0.8, remain / nImgs); // at least 0.8s per still
-        }
+    // optional music file
+    let musicPath = "";
+    let musicDur = 0;
+    if (music?.dataUrl) {
+      const { mime, buf } = decodeDataURL(music.dataUrl);
+      if (buf?.length) {
+        const ext = guessExt(music.name, mime);
+        musicPath = path.join(jobDir, `music${ext || ".mp3"}`);
+        fs.writeFileSync(musicPath, buf);
+        const mj = await probeJson(musicPath);
+        musicDur = Number(mj?.format?.duration || 0);
       }
     }
 
-    // Build segments
     const segPaths: string[] = [];
-    for (let i = 0; i < inputPaths.length; i++) {
-      const inputPath = inputPaths[i];
+    let usedTotal = 0;
+    const targetTotal = matchMusicDuration && musicDur > 0 ? musicDur : 0;
+
+    // build each segment
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const inputPath = saveIncomingItem(jobDir, it, i);
       const ext = path.extname(inputPath).toLowerCase();
       const seg = path.join(jobDir, `seg-${i}.mp4`);
 
-      if (looksLikeImage(inputPath)) {
-        await makeImageSegment(inputPath, seg, perImageDur, !!bgBlur, (motion as Motion) || "zoom_in");
+      // if we must keep within music length, compute leftover
+      let left = targetTotal ? Math.max(0, targetTotal - usedTotal) : 0;
+      const capVideo = seconds(maxPerVideoSec, 0) || 0;
+
+      if ([".png", ".jpg", ".jpeg", ".webp", ".heic", ".heif"].includes(ext)) {
+        let dur = seconds(durationSec, 2.5);
+        if (targetTotal) dur = Math.min(dur, left || dur);
+        if (targetTotal && dur <= 0.01) break;
+
+        await makeImageSegment(inputPath, seg, dur, !!bgBlur, motion);
+        segPaths.push(seg);
+        usedTotal += dur;
       } else {
-        await makeVideoSegment(inputPath, seg, !!keepVideoAudio, !!bgBlur, videoTrim);
+        // video
+        let trim = capVideo;
+        if (targetTotal && left > 0) {
+          trim = capVideo ? Math.min(capVideo, left) : left; // respect cap if set
+        }
+        await makeVideoSegment(inputPath, seg, !!keepVideoAudio, !!bgBlur, trim || undefined);
+        // figure out the produced segment duration (probe)
+        const pj = await probeJson(seg);
+        const dur = Number(pj?.format?.duration || 0);
+        if (dur > 0) usedTotal += dur;
+        segPaths.push(seg);
+
+        if (targetTotal && usedTotal >= targetTotal - 0.05) break;
       }
-      segPaths.push(seg);
     }
 
+    if (segPaths.length === 0) {
+      throw new Error("no_segments_written");
+    }
+
+    // concat
     const listPath = path.join(jobDir, "concat.txt");
     await writeConcatListAbsolute(segPaths, listPath);
 
     const outName = `reel-${jobId}.mp4`;
-    const outPathDisk = path.join(diskRoot, outName);
-    await concatSegments(listPath, outPathDisk);
+    const outPath = path.join(rendersDir, outName);
+    await concatSegments(listPath, outPath);
 
-    let finalDiskPath = outPathDisk;
-    if (bgMusicUrl && !keepVideoAudio) {
-      let musicAbs = bgMusicUrl;
-      if (musicAbs.startsWith("/")) musicAbs = path.join(process.cwd(), "public", musicAbs);
-      finalDiskPath = await replaceAudioWithMusic(outPathDisk, musicAbs); // throws if not audio
-      try { fs.unlinkSync(outPathDisk); } catch {}
+    // Optionally mix in music (when user provided music and keepVideoAudio = false)
+    let finalPath = outPath;
+    if (musicPath && !keepVideoAudio) {
+      finalPath = await replaceAudioWithMusic(outPath, musicPath);
+      try { fs.unlinkSync(outPath); } catch {}
     }
 
-    // ALWAYS ensure file is present in /public/renders for the browser
-    const publicCopy = path.join(publicRoot, path.basename(finalDiskPath));
-    try { fs.copyFileSync(finalDiskPath, publicCopy); } catch {}
+    // cleanup tmp
+    try {
+      for (const f of segPaths) fs.unlinkSync(f);
+      if (musicPath) fs.unlinkSync(musicPath);
+      fs.unlinkSync(listPath);
+      fs.rmdirSync(jobDir);
+    } catch {}
 
-    // Cleanup temp
-    try { fs.rmSync(jobDir, { recursive: true, force: true }); } catch {}
-
+    const relUrl = `/renders/${path.basename(finalPath)}`;
+    recordRender(email, relUrl, items.length);
     if (!pro) bumpCount(email);
 
-    const relUrl = `/renders/${path.basename(finalDiskPath)}`;
-    recordRender(email, relUrl, items.length);
-
-    // DB persist + prune latest 20
+    // Persist to DB + prune 20 (if Render model exists)
     try {
       const user = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
       const anyClient: any = prisma as any;
       if (user && anyClient.render) {
-        const stat = fs.statSync(finalDiskPath);
-        const fileName = path.basename(finalDiskPath);
-
-        await anyClient.render.create({
-          data: { userId: user.id, fileName, url: relUrl, bytes: stat.size },
-        });
+        const stat = fs.statSync(finalPath);
+        const fileName = path.basename(finalPath);
+        await anyClient.render.create({ data: { userId: user.id, fileName, url: relUrl, bytes: stat.size } });
 
         const KEEP = 20;
         const toDelete = await anyClient.render.findMany({
@@ -497,31 +520,21 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           skip: KEEP,
           select: { id: true, fileName: true },
         });
-
         if (toDelete.length) {
-          for (const r of toDelete) {
-            const pth = path.join(diskRoot, r.fileName);
-            try { fs.unlinkSync(pth); } catch {}
-            try { fs.unlinkSync(path.join(publicRoot, r.fileName)); } catch {}
-          }
+          for (const r of toDelete) { try { fs.unlinkSync(path.join(rendersDir, r.fileName)); } catch {} }
           await anyClient.render.deleteMany({ where: { id: { in: toDelete.map((r: any) => r.id) } } });
         }
       }
-    } catch (dbErr) {
-      console.error("RENDER_DB_PERSIST_OR_PRUNE_FAIL", dbErr);
+    } catch (e) {
+      console.warn("DB persist/prune skipped:", e);
     }
 
-    return res.json({
-      ok: true,
-      url: relUrl,
-      usedPerImageSec: perImageDur,
-      matchedToMusic: !!(matchMusicDuration && bgMusicUrl),
-    });
+    // Always a real mp4 path (no .htm)
+    return res.json({ ok: true, url: relUrl });
   } catch (e: any) {
     console.error("RENDER_FAIL", e?.message || e);
     return res.status(500).json({ ok: false, error: "render_failed", details: e?.message || String(e) });
   }
 }
 
-// allow large image dataURLs
 export const config = { api: { bodyParser: { sizeLimit: "150mb" } } };
