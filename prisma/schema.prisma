@@ -7,6 +7,10 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+/**
+ * ------------------------- Domain Models -------------------------
+ */
+
 model Render {
   id        String   @id @default(cuid())
   userId    String
@@ -43,8 +47,9 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  renders   Render[]
-  RenderJob RenderJob[]
+  renders    Render[]
+  // ✅ proper relation field name (lowerCamel) and type
+  renderJobs RenderJob[]
 }
 
 model Account {
@@ -114,6 +119,10 @@ model PasswordResetToken {
   @@index([email])
 }
 
+/**
+ * ------------------------- Render Queue -------------------------
+ */
+
 enum RenderJobStatus {
   QUEUED
   RUNNING
@@ -122,16 +131,30 @@ enum RenderJobStatus {
 }
 
 model RenderJob {
-  id          String           @id @default(cuid())
-  userEmail   String
-  status      RenderJobStatus  @default(QUEUED)
-  items       Json             // array of {name?:string, mime?:string, dataUrl?:string, url?:string}
-  options     Json             // { durationSec, maxPerVideoSec, keepVideoAudio, bgBlur, motion, music? }
-  outputUrl   String?          // /renders/reel-<id>.mp4
-  error       String?
-  createdAt   DateTime         @default(now())
-  updatedAt   DateTime         @updatedAt
+  id String @id @default(cuid())
 
+  // ✅ opposite side of the relation to User
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Optional denormalized email if you still want it
+  userEmail String?
+
+  status RenderJobStatus @default(QUEUED)
+
+  // Payload/options your worker needs
+  items   Json // array of {name?:string, mime?:string, dataUrl?:string, url?:string}
+  options Json // { durationSec, maxPerVideoSec, keepVideoAudio, bgBlur, motion, music? }
+
+  outputUrl String? // e.g. /renders/reel-<id>.mp4
+  error     String?
+
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  startedAt  DateTime?
+  finishedAt DateTime?
+
+  @@index([userId, createdAt])
   @@index([status, createdAt])
   @@index([userEmail, createdAt])
 }
