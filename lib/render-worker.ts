@@ -1,39 +1,37 @@
 // lib/render-worker.ts
-/**
- * Minimal, safe worker:
- * - Compiles against a RenderJob model WITHOUT startedAt/finishedAt/options
- * - Never references unknown constants like RENDERS_FILE
- * - If a queued job is found, mark it failed with a helpful message
- *   (your app currently renders synchronously via /api/render)
- */
-
 import { prisma } from "./prisma";
+import type { RenderJobStatus } from "@prisma/client";
+
+// Typed enum values (your Prisma enum is lowercase)
+const QUEUED: RenderJobStatus = "queued";
+const FAILED: RenderJobStatus = "failed";
 
 // ensure single interval per process
 const g = global as unknown as { __renderWorkerBooted?: boolean };
 if (!g.__renderWorkerBooted) {
   g.__renderWorkerBooted = true;
-  // tick every 15s; extremely cheap
-  setInterval(() => void tick().catch(() => {}), 15000);
+  setInterval(() => {
+    tick().catch((err) =>
+      console.error("render-worker tick error:", err?.message || err)
+    );
+  }, 15000);
 }
 
 async function tick() {
-  // find the oldest queued job (if any)
+  // Find the oldest queued job (if any)
   const job = await prisma.renderJob.findFirst({
-    where: { status: "queued" },
+    where: { status: QUEUED },
     orderBy: { createdAt: "asc" },
   });
   if (!job) return;
 
-  // Your app renders directly in /api/render for now, so queued jobs
-  // shouldn't exist. Mark them failed with a clear message (and DO NOT
-  // write fields that aren't in your schema, like startedAt/finishedAt).
+  // Your app renders directly via /api/render for now.
   await prisma.renderJob.update({
     where: { id: job.id },
     data: {
-      status: "failed",
+      status: FAILED,
       error:
-        "Background worker is not enabled. The app renders directly via /api/render.",
+        "Background worker is not enabled to process queued jobs. The app renders directly via /api/render.",
     },
   });
 }
