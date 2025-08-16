@@ -22,8 +22,18 @@ export default function Studio() {
   const [motion, setMotion] = useState<"zoom_in"|"zoom_out"|"pan_left"|"pan_right"|"cover">("zoom_in");
   const [matchMusicDuration, setMatchMusicDuration] = useState(false);
 
+  const [rendering, setRendering] = useState(false);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
+
+  // cleanup preview URLs on unmount
+  useEffect(() => {
+    return () => {
+      items.forEach(i => { try { URL.revokeObjectURL(i.previewUrl); } catch {} });
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function onPickFiles(e: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files || []);
@@ -45,6 +55,8 @@ export default function Studio() {
     setMusicFile(f);
     setMusicDur(0);
     if (f) {
+      // If user chooses a track, we'll use that instead of original video audio
+      setKeepVideoAudio(false);
       const url = URL.createObjectURL(f);
       const a = new Audio();
       a.src = url;
@@ -68,7 +80,6 @@ export default function Studio() {
 
   // suggestion: how many stills fit in music length (rough; videos counted via max cap)
   const suggestedCount = useMemo(() => {
-    const imgCount = items.filter((x) => x.kind === "image").length;
     const vidCount = items.filter((x) => x.kind === "video").length;
     const perImg = Number(durationSec) || 2.5;
     const cap = Number(maxPerVideoSec) || 0;
@@ -90,11 +101,13 @@ export default function Studio() {
   }
 
   async function submit() {
+    if (rendering) return;
     try {
       if (items.length === 0) {
         toast.error("Pick some files first.");
         return;
       }
+      setRendering(true);
       toast.dismiss();
       toast.loading("Rendering…");
 
@@ -110,6 +123,7 @@ export default function Studio() {
         ? { name: musicFile.name, dataUrl: await fileToDataUrl(musicFile) }
         : undefined;
 
+      // Kick off the render
       const r = await fetch("/api/render", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -120,24 +134,61 @@ export default function Studio() {
           keepVideoAudio,
           bgBlur,
           motion,
-          music,                    // new: send the music blob
-          matchMusicDuration,       // new: optional clamp
+          music,                    // send the music blob (if any)
+          matchMusicDuration,       // optional clamp server-side
         }),
       });
 
       const j = await r.json().catch(() => ({}));
-      toast.dismiss();
+
       if (!r.ok || !j?.ok) {
-        console.error("RENDER_FAIL", j);
+        toast.dismiss();
         toast.error(j?.message || j?.error || "Render failed.");
+        setRendering(false);
         return;
       }
-      toast.success("Done! Opening…");
-      window.location.href = j.url; // open the reel
-    } catch (e) {
+
+      // Backend mode A: immediate url (sync render)
+      if (j.url) {
+        toast.dismiss();
+        toast.success("Done! Opening…");
+        window.location.href = j.url;
+        setRendering(false);
+        return;
+      }
+
+      // Backend mode B: queued jobId → poll /api/render-status
+      const jobId: string | undefined = j.jobId;
+      if (!jobId) {
+        toast.dismiss();
+        toast.error("Render started but no jobId returned.");
+        setRendering(false);
+        return;
+      }
+
+      let done = false;
+      while (!done) {
+        await new Promise((res) => setTimeout(res, 2000));
+        const s = await fetch(`/api/render-status?jobId=${jobId}`).then((r) => r.json()).catch(()=>null);
+        if (!s?.ok) continue;
+
+        if (s.status === "done" && s.url) {
+          toast.dismiss();
+          toast.success("Done! Opening…");
+          window.location.href = s.url;
+          done = true;
+        } else if (s.status === "failed") {
+          toast.dismiss();
+          toast.error(s?.error || "Render failed");
+          done = true;
+        }
+      }
+    } catch (e: any) {
       console.error(e);
       toast.dismiss();
-      toast.error("Render failed.");
+      toast.error(e?.message || "Render failed.");
+    } finally {
+      setRendering(false);
     }
   }
 
@@ -293,9 +344,10 @@ export default function Studio() {
       <div className="mt-4">
         <button
           onClick={submit}
-          className="rounded-2xl bg-pink-500 text-white px-5 py-2 font-semibold hover:bg-pink-400"
+          disabled={rendering}
+          className="rounded-2xl bg-pink-500 text-white px-5 py-2 font-semibold hover:bg-pink-400 disabled:opacity-60"
         >
-          Create Reel
+          {rendering ? "Rendering…" : "Create Reel"}
         </button>
       </div>
     </section>
