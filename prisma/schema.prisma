@@ -43,7 +43,8 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  renders Render[]
+  renders   Render[]
+  RenderJob RenderJob[]
 }
 
 model Account {
@@ -111,4 +112,28 @@ model PasswordResetToken {
   createdAt DateTime @default(now())
 
   @@index([email])
+}
+
+enum RenderJobStatus {
+  queued
+  working
+  done
+  failed
+}
+
+model RenderJob {
+  id        String   @id @default(cuid())
+  userEmail String
+  status    String // "queued" | "processing" | "done" | "failed"
+  payload   Json
+  outputUrl String?
+  error     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // optional link to User if you want it
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userEmail, createdAt])
 }
