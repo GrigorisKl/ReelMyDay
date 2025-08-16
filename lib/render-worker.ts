@@ -1,37 +1,36 @@
 // lib/render-worker.ts
 import { prisma } from "./prisma";
-import type { RenderJobStatus } from "@prisma/client";
+type RenderJobStatus = "QUEUED" | "RUNNING" | "DONE" | "FAILED";
 
-// Typed enum values (your Prisma enum is lowercase)
-const QUEUED: RenderJobStatus = "queued";
-const FAILED: RenderJobStatus = "failed";
+// Your schema has UPPERCASE enum values:
+// enum RenderJobStatus { QUEUED RUNNING DONE FAILED }
+const QUEUED: RenderJobStatus = "QUEUED";
+const FAILED:  RenderJobStatus = "FAILED";
 
-// ensure single interval per process
+// guard so the interval isn’t registered twice in dev/hot reload
 const g = global as unknown as { __renderWorkerBooted?: boolean };
 if (!g.__renderWorkerBooted) {
   g.__renderWorkerBooted = true;
-  setInterval(() => {
-    tick().catch((err) =>
-      console.error("render-worker tick error:", err?.message || err)
-    );
-  }, 15000);
+  setInterval(() => { void tick(); }, 15_000);
 }
 
 async function tick() {
-  // Find the oldest queued job (if any)
+  // Oldest queued job
   const job = await prisma.renderJob.findFirst({
     where: { status: QUEUED },
     orderBy: { createdAt: "asc" },
   });
   if (!job) return;
 
-  // Your app renders directly via /api/render for now.
+  // You currently render synchronously in /api/render
   await prisma.renderJob.update({
     where: { id: job.id },
     data: {
       status: FAILED,
       error:
-        "Background worker is not enabled to process queued jobs. The app renders directly via /api/render.",
+        "Background worker not enabled to process queued jobs. The app renders directly via /api/render.",
     },
   });
 }
+
+export {};
