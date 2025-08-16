@@ -1,4 +1,3 @@
-// pages/api/render-status.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth/next";
 import type { Session } from "next-auth";
@@ -9,15 +8,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   if (req.method !== "GET") return res.status(405).end();
 
   try {
-    // Cast the session so TS knows it has `.user`
     const session = (await getServerSession(req, res, authOptions as any)) as Session | null;
-    const email = session?.user?.email ?? null;
+    const email = session?.user?.email || null;
     if (!email) return res.status(401).json({ ok: false });
 
     const id = String(req.query.jobId || "");
     if (!id) return res.status(400).json({ ok: false, error: "missing_jobId" });
 
-    // If you created the RenderJob model:
     const job = await prisma.renderJob.findUnique({ where: { id } });
     if (!job || job.userEmail.toLowerCase() !== email.toLowerCase()) {
       return res.status(404).json({ ok: false });
@@ -29,8 +26,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       url: job.outputUrl ?? null,
       error: job.error ?? null,
     });
-  } catch (err) {
-    console.error("RENDER_STATUS_ERR", err);
+  } catch (e) {
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 }

@@ -115,25 +115,23 @@ model PasswordResetToken {
 }
 
 enum RenderJobStatus {
-  queued
-  working
-  done
-  failed
+  QUEUED
+  RUNNING
+  DONE
+  FAILED
 }
 
 model RenderJob {
-  id        String   @id @default(cuid())
-  userEmail String
-  status    String // "queued" | "processing" | "done" | "failed"
-  payload   Json
-  outputUrl String?
-  error     String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id          String           @id @default(cuid())
+  userEmail   String
+  status      RenderJobStatus  @default(QUEUED)
+  items       Json             // array of {name?:string, mime?:string, dataUrl?:string, url?:string}
+  options     Json             // { durationSec, maxPerVideoSec, keepVideoAudio, bgBlur, motion, music? }
+  outputUrl   String?          // /renders/reel-<id>.mp4
+  error       String?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
 
-  // optional link to User if you want it
-  userId String?
-  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
-
+  @@index([status, createdAt])
   @@index([userEmail, createdAt])
 }

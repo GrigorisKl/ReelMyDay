@@ -101,17 +101,14 @@ export default function Studio() {
   }
 
   async function submit() {
-    if (rendering) return;
     try {
       if (items.length === 0) {
         toast.error("Pick some files first.");
         return;
       }
-      setRendering(true);
       toast.dismiss();
-      toast.loading("Rendering…");
+      toast.loading("Queued…");
 
-      // turn all into dataUrls (server expects dataUrl or url)
       const payloadItems = await Promise.all(
         items.map(async (m) => ({
           name: m.name,
@@ -121,9 +118,8 @@ export default function Studio() {
 
       const music = musicFile
         ? { name: musicFile.name, dataUrl: await fileToDataUrl(musicFile) }
-        : undefined;
+        : null;
 
-      // Kick off the render
       const r = await fetch("/api/render", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -134,61 +130,42 @@ export default function Studio() {
           keepVideoAudio,
           bgBlur,
           motion,
-          music,                    // send the music blob (if any)
-          matchMusicDuration,       // optional clamp server-side
+          music,
         }),
       });
-
       const j = await r.json().catch(() => ({}));
-
       if (!r.ok || !j?.ok) {
         toast.dismiss();
-        toast.error(j?.message || j?.error || "Render failed.");
-        setRendering(false);
+        toast.error(j?.message || j?.error || "Could not start render");
         return;
       }
 
-      // Backend mode A: immediate url (sync render)
-      if (j.url) {
-        toast.dismiss();
-        toast.success("Done! Opening…");
-        window.location.href = j.url;
-        setRendering(false);
-        return;
-      }
+      const jobId = j.jobId as string;
+      toast.dismiss();
+      toast.loading("Rendering…");
 
-      // Backend mode B: queued jobId → poll /api/render-status
-      const jobId: string | undefined = j.jobId;
-      if (!jobId) {
-        toast.dismiss();
-        toast.error("Render started but no jobId returned.");
-        setRendering(false);
-        return;
-      }
-
-      let done = false;
-      while (!done) {
-        await new Promise((res) => setTimeout(res, 2000));
+      let tries = 0;
+      while (true) {
+        await new Promise((r) => setTimeout(r, 2000));
         const s = await fetch(`/api/render-status?jobId=${jobId}`).then((r) => r.json()).catch(()=>null);
-        if (!s?.ok) continue;
-
-        if (s.status === "done" && s.url) {
+        if (!s?.ok) { if (++tries > 240) break; continue; } // ~8 min timeout
+        if (s.status === "DONE" && s.url) {
           toast.dismiss();
-          toast.success("Done! Opening…");
+          toast.success("Done!");
           window.location.href = s.url;
-          done = true;
-        } else if (s.status === "failed") {
+          return;
+        } else if (s.status === "FAILED") {
           toast.dismiss();
-          toast.error(s?.error || "Render failed");
-          done = true;
+          toast.error(s.error || "Render failed");
+          return;
         }
       }
-    } catch (e: any) {
-      console.error(e);
+
       toast.dismiss();
-      toast.error(e?.message || "Render failed.");
-    } finally {
-      setRendering(false);
+      toast.error("Timed out. Check Renders page later.");
+    } catch (e) {
+      toast.dismiss();
+      toast.error("Render failed.");
     }
   }
 
