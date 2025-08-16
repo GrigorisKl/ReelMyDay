@@ -1,3 +1,4 @@
+// pages/api/render-status.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth/next";
 import type { Session } from "next-auth";
@@ -6,10 +7,9 @@ import { prisma } from "../../lib/prisma";
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "GET") return res.status(405).end();
-
   try {
     const session = (await getServerSession(req, res, authOptions as any)) as Session | null;
-    const email = session?.user?.email || null;
+    const email = session?.user?.email ?? null;
     if (!email) return res.status(401).json({ ok: false });
 
     const id = String(req.query.jobId || "");
@@ -26,7 +26,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       url: job.outputUrl ?? null,
       error: job.error ?? null,
     });
-  } catch (e) {
+  } catch (err) {
+    console.error("RENDER_STATUS_ERR", err);
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 }

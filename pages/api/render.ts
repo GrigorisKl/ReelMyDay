@@ -4,15 +4,11 @@ import { getServerSession } from "next-auth/next";
 import type { Session } from "next-auth";
 import { authOptions } from "./auth/[...nextauth]";
 import { prisma } from "../../lib/prisma";
-import { Prisma } from "@prisma/client";
-
-// Start the singleton worker loop (make sure the file is lib/render-worker.ts)
 import "../../lib/render-worker";
 
 // ---------- simple gating + usage (legacy JSON) ----------
 import * as fs from "node:fs";
 import * as path from "node:path";
-
 function ensureDir(p: string) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
 const DATA_DIR = path.join(process.cwd(), "data");
 const USAGE_FILE = path.join(DATA_DIR, "usage.json");
@@ -34,9 +30,10 @@ async function isProEmail(email:string){
   try{ const u=await prisma.user.findUnique({ where:{ email:e }, select:{ isPro:true } }); return !!u?.isPro; }catch{ return false; }
 }
 
-// ---------- limits ----------
-const MAX_ITEMS = Number(process.env.RM_MAX_ITEMS ?? 40);
-const MAX_TOTAL = Number(process.env.RM_MAX_TOTAL_BYTES ?? 250_000_000); // ~238MB
+// ---------- size limits ----------
+const MAX_ITEMS = Number(process.env.RM_MAX_ITEMS || 60);
+const MAX_TOTAL = Number(process.env.RM_MAX_TOTAL_BYTES || 300_000_000); // ~286 MB
+
 function approxBytesFromDataUrl(s:string){
   const m = /^data:.*;base64,/.exec(s); const head = m? m[0].length : 0;
   const b64 = s.slice(head);
@@ -77,33 +74,32 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (body.music?.dataUrl) total += approxBytesFromDataUrl(body.music.dataUrl);
     if (total > MAX_TOTAL) return res.status(413).json({ ok:false, error:"payload_too_large", limit: MAX_TOTAL });
 
-    // find the user (needed for relation connect)
-    const user = await prisma.user.findUnique({
-      where: { email: email.toLowerCase() },
+    // --- ensure user exists (so we can satisfy the RenderJob.user relation) ---
+    const e = email.toLowerCase();
+    const user = await prisma.user.upsert({
+      where: { email: e },
+      update: {},
+      create: { email: e },
       select: { id: true },
     });
-    if (!user) return res.status(401).json({ ok:false, error:"user_not_found" });
 
-    // Prisma JSON typing
-    const itemsJson = items as unknown as Prisma.JsonArray;
-    const optionsJson = {
-      durationSec: Number(body.durationSec ?? 2.5),
-      maxPerVideoSec: Number(body.maxPerVideoSec ?? 0),
-      keepVideoAudio: !!body.keepVideoAudio,
-      bgBlur: body.bgBlur !== false,
-      motion: body.motion || "zoom_in",
-      music: body.music || null,
-      matchMusicDuration: !!body.matchMusicDuration,
-    } as unknown as Prisma.JsonObject;
-
-    // Enqueue job with REQUIRED user relation
+    // --- create job with REQUIRED relation 'user' ---
     const job = await prisma.renderJob.create({
       data: {
-        user: { connect: { id: user.id } }, // <-- satisfies the required relation
-        userEmail: email.toLowerCase(),
         status: "QUEUED",
-        items: itemsJson,
-        options: optionsJson,
+        user: { connect: { id: user.id } }, // <— THIS fixes your TS error
+        // keep userEmail if your schema has it (remove if it does not):
+        userEmail: e,
+        items,
+        options: {
+          durationSec: Number(body.durationSec ?? 2.5),
+          maxPerVideoSec: Number(body.maxPerVideoSec ?? 0),
+          keepVideoAudio: !!body.keepVideoAudio,
+          bgBlur: body.bgBlur !== false,
+          motion: body.motion || "zoom_in",
+          music: body.music || null,
+          matchMusicDuration: !!body.matchMusicDuration,
+        } as any,
       },
       select: { id: true },
     });
